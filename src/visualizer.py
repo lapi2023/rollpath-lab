@@ -1,0 +1,1484 @@
+# visualizer.py — v18 (English-only; dynamic year ticks; stacked bars for DCA representative paths + CSV exports)
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import List, Optional
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import numpy as np
+import pandas as pd
+from src.utils import format_number_kmg, format_integer_commas
+import seaborn as sns
+from matplotlib import font_manager, rcParams
+from rich.console import Console
+from rich.table import Table
+
+
+# =============================================================================
+# Font (force a CJK-capable family to avoid missing glyphs)
+# =============================================================================
+def _set_cjk_font(prefer: Optional[List[str]] = None) -> Optional[str]:
+    candidates = prefer or [
+        "Yu Gothic UI",
+        "Yu Gothic",
+        "Meiryo",
+        "MS Gothic",  # Windows
+        "Hiragino Sans",
+        "Hiragino Kaku Gothic ProN",  # macOS
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "IPAexGothic",
+        "IPAGothic",  # Common
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for fam in candidates:
+        if fam in available:
+            rcParams["font.family"] = [fam]
+            rcParams["font.sans-serif"] = [
+                fam,
+                "Noto Sans CJK JP",
+                "Yu Gothic UI",
+                "Meiryo",
+                "MS Gothic",
+                "IPAexGothic",
+                "IPAGothic",
+            ]
+            rcParams["axes.unicode_minus"] = False
+            return fam
+    rcParams["axes.unicode_minus"] = False
+    return None
+
+
+_CHOSEN_CJK = _set_cjk_font()
+if not _CHOSEN_CJK:
+    print("[viz] CJK font not found; you may see missing-glyph warnings.")
+
+
+# =============================================================================
+# Save (delegate watermark)
+# =============================================================================
+def save_with_watermarks(filepath: Path, dpi: int = 300, bbox_inches=None) -> None:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from . import watermark as _wm  # type: ignore
+
+        _wm.save_with_watermarks(filepath=filepath, dpi=dpi, bbox_inches=bbox_inches)
+    except Exception:
+        plt.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches)
+    plt.close()
+
+
+# =============================================================================
+# Helpers (robust access)
+# =============================================================================
+def _infer_ppy(freq: str) -> int:
+    f = (freq or "").lower()
+    if f in ("", "daily", "day"):
+        return 252
+    if f in ("monthly", "month"):
+        return 12
+    if f in ("yearly", "year"):
+        return 1
+    return 252
+
+
+def _make_caption(
+    start_date,
+    end_date,
+    freq,
+    rebalance,
+    missing,
+    style,
+    amount,
+    initial_cap,
+    window,
+    ppy: Optional[int] = None,
+    dca_interval: Optional[str] = None,
+) -> str:
+    """
+    Build a caption line for figures. For DCA, include Total Principal
+    computed from (initial_cap + amount * #contrib within window).
+    """
+    style_norm = (style or "").lower()
+    total_principal_str = ""
+    if style_norm == "dca" and (ppy is not None) and (window is not None):
+        # reuse contrib-mask logic
+        inter = dca_interval or "every_period"
+
+        def _step(ppy, inter):
+            inter = inter.lower()
+            if inter in ("", "every_period"):
+                return 1
+            if inter == "weekly":
+                return max(1, int(round((ppy or 252) / 52)))
+            if inter == "monthly":
+                return max(1, int(round((ppy or 252) / 12)))
+            if inter == "quarterly":
+                return max(1, int(round((ppy or 252) / 4)))
+            if inter == "yearly":
+                return max(1, int(round((ppy or 252) / 1)))
+            return 1
+
+        step = _step(ppy, inter)
+        mask = np.zeros(int(window), dtype=bool)
+        upto = max(0, int(window) - 1)
+        mask[0:upto:step] = True  # no contribution on the very last step
+        n_contrib = int(mask.sum())
+        total_principal = float(initial_cap) + float(amount) * n_contrib
+        total_principal_str = f" Total Principal: {total_principal:,.0f}"
+
+    if style_norm == "dca":
+        style_str = (
+            f"DCA (Init: {initial_cap:,.0f}, {amount:,.0f}/period, "
+            f"Window={window}){total_principal_str}"
+        )
+    else:
+        style_str = f"Lump Sum (Window={window})"
+    return (
+        f"Period: {start_date} to {end_date} Freq: {freq} Rebalance: {rebalance} Missing: {missing}\n"
+        f"Investment Style: {style_str}"
+    )
+
+
+def _safe_name(s: str) -> str:
+    s2 = re.sub(r"[^A-Za-z0-9.\_ \-]+", "_", str(s))
+    s2 = re.sub(r"\s+", "_", s2)
+    s2 = re.sub(r"_+", "_", s2).strip("_")
+    return s2
+
+
+def _get_array(d: dict, keys: List[str]) -> np.ndarray:
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return np.asarray(d[k], dtype=float)
+            except Exception:
+                pass
+    return np.asarray([], dtype=float)
+
+
+def _get_scalar(d: dict, keys: List[str], default: float = np.nan) -> float:
+    for k in keys:
+        if k in d and d[k] is not None:
+            v = d[k]
+            try:
+                arr = np.asarray(v, dtype=float)
+                if arr.ndim == 0:
+                    return float(arr)
+                if arr.size == 0:
+                    return float(default)
+                return float(np.median(arr))
+            except Exception:
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+    return float(default)
+
+
+def _has_any_key(results: dict, keys: List[str]) -> bool:
+    return any(any(k in results[p] for k in keys) for p in results.keys())
+
+
+def _contrib_mask_for_window(
+    window: int, ppy: int, dca_interval: Optional[str]
+) -> np.ndarray:
+    inter = (dca_interval or "every_period").lower()
+    if inter == "every_period":
+        step = 1
+    elif inter == "weekly":
+        step = max(1, int(round(ppy / 52)))
+    elif inter == "monthly":
+        step = max(1, int(round(ppy / 12)))
+    elif inter == "quarterly":
+        step = max(1, int(round(ppy / 4)))
+    elif inter == "yearly":
+        step = max(1, int(round(ppy / 1)))
+    else:
+        step = 1
+    mask = np.zeros(window, dtype=bool)
+    upto = max(0, window - 1)
+    mask[0:upto:step] = True
+    mask[-1] = False
+    return mask
+
+
+def _year_ticks(L: int, ppy: int):
+    """
+    Return (ticks, labels) for a step axis with 'Year' markers (Y1, Y2, ...).
+    Automatically chooses a coarser step for long windows so labels don't crowd.
+    """
+    if ppy is None or ppy <= 0:
+        ppy = 252
+
+    total_years = max(1, int(round(L / float(ppy))))
+    # Choose step size based on total years
+    # <=20y: 1y, <=50y: 2y, <=100y: 5y, <=200y: 10y, otherwise: 20y
+    if total_years <= 20:
+        step_years = 1
+    elif total_years <= 50:
+        step_years = 2
+    elif total_years <= 100:
+        step_years = 5
+    elif total_years <= 200:
+        step_years = 10
+    else:
+        step_years = 20
+
+    # tick positions are in "period steps"
+    y_step = max(1, int(round(ppy * step_years)))
+    ticks = np.arange(y_step, L + 1, y_step, dtype=int)
+
+    # Labels like Y1, Y3, Y5 ... according to step_years
+    labels = [f"Y{int(round(t / float(ppy)))}" for t in ticks]
+    return ticks, labels
+
+
+def _dca_irr_from_median_fv(
+    fv_median: float,
+    window: int,
+    ppy: int,
+    amount: float,
+    initial_cap: float,
+    dca_interval: Optional[str] = None,
+    *,
+    max_iter: int = 120,
+    tol: float = 1e-10,
+) -> float:
+    """
+    IRR (annualized) solved from median Final Value given the DCA cash-flow schedule.
+    Contributions occur at period start; no contribution at last step.
+    """
+    if not np.isfinite(fv_median) or fv_median <= 0 or window <= 1 or ppy <= 0:
+        return np.nan
+
+    inter = (dca_interval or "every_period").lower()
+    if inter == "every_period":
+        step = 1
+    elif inter == "weekly":
+        step = max(1, int(round(ppy / 52)))
+    elif inter == "monthly":
+        step = max(1, int(round(ppy / 12)))
+    elif inter == "quarterly":
+        step = max(1, int(round(ppy / 4)))
+    elif inter == "yearly":
+        step = max(1, int(round(ppy / 1)))
+    else:
+        step = 1
+
+    upto = max(0, window - 1)
+    K = np.arange(0, upto, step, dtype=float)
+    Y = float(window) / float(ppy)
+
+    I0 = float(initial_cap)
+    A = float(amount)
+
+    def f(r: float) -> float:
+        base = 1.0 + r
+        if base <= 0.0:
+            return np.inf
+        term0 = I0 * (base**Y)
+        termA = 0.0 if A == 0.0 else A * np.sum(base ** (Y - K / float(ppy)))
+        return term0 + termA - float(fv_median)
+
+    lo, hi = -0.999, 10.0
+    flo, fhi = f(lo), f(hi)
+    it_expand = 0
+    while np.sign(flo) == np.sign(fhi) and it_expand < 24:
+        hi *= 1.5
+        fhi = f(hi)
+        it_expand += 1
+    if np.isnan(flo) or np.isnan(fhi) or np.sign(flo) == np.sign(fhi):
+        return np.nan
+
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        fm = f(mid)
+        if not np.isfinite(fm):
+            return np.nan
+        if abs(fm) < tol or abs(hi - lo) < max(tol, 1e-12):
+            return float(mid)
+        if np.sign(fm) == np.sign(flo):
+            lo, flo = mid, fm
+        else:
+            hi, fhi = mid, fm
+    return float(0.5 * (lo + hi))
+
+
+# =============================================================================
+# Console tables (English labels)
+# =============================================================================
+def print_summary_table(
+    console: Console,
+    portfolio_names: List[str],
+    results: dict,
+    val: int,
+    unit: str,
+    style: str,
+    amount: float,
+    initial_cap: float,
+    window: int,
+    ppy: Optional[int] = None,
+    dca_interval: Optional[str] = None,
+    **kwargs,
+) -> None:
+    if ppy is None:
+        ppy = 252
+    dca_interval = dca_interval or "every_period"
+    style_norm = (style or "").lower()
+    is_dca = style_norm == "dca"
+    use_dca_value_table = is_dca
+
+    def _principal_from_window() -> float:
+        if not is_dca:
+            return float(initial_cap if initial_cap and initial_cap > 0 else 1.0)
+        mask = _contrib_mask_for_window(window, ppy, dca_interval)
+        n_contrib = int(mask.sum())
+        return float(initial_cap) + float(amount) * n_contrib
+
+    principal_window = _principal_from_window()
+
+    if use_dca_value_table:
+        title = (
+            f"Rolling Performance Summary ({val} {unit}) "
+            f"[DCA Init: {initial_cap:,.0f} Total Principal: {principal_window:,.0f}]"
+        )
+        summary_table = Table(title=title)
+        cols = [
+            "Portfolio",
+            "Final(Mean)",
+            "Final(Min)",
+            "Final(25%)",
+            "Final(Med)",
+            "Final(75%)",
+            "Final(Max)",
+            "Path Min(Med)",
+            "Path Max(Med)",
+            "Tot CAGR(Med)",
+            "IRR(Med)",
+            "Max Drawup(Med)",
+            "Max DD(Med)",
+        ]
+        for c in cols:
+            summary_table.add_column(
+                c, justify=("left" if c == "Portfolio" else "right"), no_wrap=True
+            )
+
+        for p in portfolio_names:
+            m = results.get(p, {})
+            fv = _get_array(m, ["Final_Value"])
+            fv_med = float(np.median(fv)) if fv.size else np.nan
+            path_min = _get_scalar(m, ["Path_Min", "PathMin"])
+            path_max = _get_scalar(m, ["Path_Max", "PathMax"])
+            max_up = _get_scalar(m, ["Max_Drawup", "MaxDrawup"])
+            max_dd = _get_scalar(m, ["Max_DD", "MaxDD"])
+            tot_cagr_simple_med = _get_scalar(m, ["CAGR_Simple"], default=np.nan)
+            if (
+                (not np.isfinite(tot_cagr_simple_med))
+                and np.isfinite(fv_med)
+                and principal_window > 0
+                and window > 0
+                and ppy > 0
+            ):
+                years = float(window) / float(ppy)
+                base = max(fv_med / principal_window, 1e-12)
+                tot_cagr_simple_med = np.power(base, 1.0 / years) - 1.0
+
+            irr_med = (
+                _dca_irr_from_median_fv(
+                    fv_median=fv_med,
+                    window=window,
+                    ppy=ppy,
+                    amount=float(amount or 0.0),
+                    initial_cap=float(initial_cap or 0.0),
+                    dca_interval=(dca_interval or "every_period"),
+                )
+                if np.isfinite(fv_med)
+                else np.nan
+            )
+
+            row = [
+                p,
+                (f"{np.mean(fv):,.0f}" if fv.size else "—"),
+                (f"{np.min(fv):,.0f}" if fv.size else "—"),
+                (f"{np.percentile(fv, 25):,.0f}" if fv.size else "—"),
+                (f"{fv_med:,.0f}" if np.isfinite(fv_med) else "—"),
+                (f"{np.percentile(fv, 75):,.0f}" if fv.size else "—"),
+                (f"{np.max(fv):,.0f}" if fv.size else "—"),
+                (f"{path_min:,.0f}" if np.isfinite(path_min) else "—"),
+                (f"{path_max:,.0f}" if np.isfinite(path_max) else "—"),
+                (
+                    f"{tot_cagr_simple_med:.2%}"
+                    if np.isfinite(tot_cagr_simple_med)
+                    else "—"
+                ),
+                (f"{irr_med:.2%}" if np.isfinite(irr_med) else "—"),
+                f"{max_up:.2%}" if np.isfinite(max_up) else "—",
+                f"{max_dd:.2%}" if np.isfinite(max_dd) else "—",
+            ]
+            summary_table.add_row(*row)
+        console.print(summary_table)
+    else:
+        title = f"Rolling Performance Summary ({val} {unit}) [Lump Sum metrics (Return%) used]"
+        summary_table = Table(title=title)
+        cols = [
+            "Portfolio",
+            "Mean",
+            "Min",
+            "25%",
+            "Median",
+            "75%",
+            "Max",
+            "Path Min(Med)",
+            "Path Max(Med)",
+            "CAGR(Med)",
+            "Risk(Med)",
+            "Sharpe(Med)",
+            "Max Drawup(Med)",
+            "Max DD(Med)",
+        ]
+        for c in cols:
+            summary_table.add_column(
+                c, justify=("left" if c == "Portfolio" else "right"), no_wrap=True
+            )
+        for p in portfolio_names:
+            m = results.get(p, {})
+            r = _get_array(m, ["Return"])
+            path_min = _get_scalar(m, ["Path_Min", "PathMin"])
+            path_max = _get_scalar(m, ["Path_Max", "PathMax"])
+            cagr_med = _get_scalar(m, ["CAGR"])
+            risk_med = _get_scalar(m, ["Risk"])
+            shrp_med = _get_scalar(m, ["Sharpe"])
+            max_up = _get_scalar(m, ["Max_Drawup", "MaxDrawup"])
+            max_dd = _get_scalar(m, ["Max_DD", "MaxDD"])
+            summary_table.add_row(
+                p,
+                (f"{np.mean(r):.2%}" if r.size else "—"),
+                (f"{np.min(r):.2%}" if r.size else "—"),
+                (f"{np.percentile(r, 25):.2%}" if r.size else "—"),
+                (f"{np.median(r):.2%}" if r.size else "—"),
+                (f"{np.percentile(r, 75):.2%}" if r.size else "—"),
+                (f"{np.max(r):.2%}" if r.size else "—"),
+                f"{path_min:.2f}" if np.isfinite(path_min) else "—",
+                f"{path_max:.2f}" if np.isfinite(path_max) else "—",
+                f"{cagr_med:.2%}" if np.isfinite(cagr_med) else "—",
+                f"{risk_med:.2%}" if np.isfinite(risk_med) else "—",
+                f"{shrp_med:.2f}" if np.isfinite(shrp_med) else "—",
+                f"{max_up:.2%}" if np.isfinite(max_up) else "—",
+                f"{max_dd:.2%}" if np.isfinite(max_dd) else "—",
+            )
+        console.print(summary_table)
+
+
+def print_win_rate_table(
+    console: Console, portfolio_names: List[str], results: dict
+) -> None:
+    # NOTE: Text import may be needed if not already imported where used.
+    from rich.text import Text
+
+    title = Text(
+        "Win Rate Matrix (Row returns > Column returns)",
+        no_wrap=True,
+        overflow="ignore",
+    )
+    win_rate_table = Table(title=title)
+    win_rate_table.add_column("Portfolio", style="cyan", no_wrap=True)
+    for p in portfolio_names:
+        win_rate_table.add_column(p, justify="right", no_wrap=True)
+    for p1 in portfolio_names:
+        row = [f"[bold]{p1}[/]"]
+        for p2 in portfolio_names:
+            if p1 == p2:
+                row.append("-")
+                continue
+            r1 = _get_array(results.get(p1, {}), ["Return"])
+            r2 = _get_array(results.get(p2, {}), ["Return"])
+            if r1.size == 0 or r2.size == 0:
+                row.append("—")
+            else:
+                wins = np.sum(r1 > r2)
+                total = min(len(r1), len(r2))
+                wr = wins / total if total else 0.0
+                color = "green" if wr > 0.5 else "red"
+                row.append(f"[{color}]{wr:.2%}[/]")
+        win_rate_table.add_row(*row)
+    console.print(win_rate_table)
+
+
+# =============================================================================
+# Charts + CSV exports
+# =============================================================================
+def save_charts_and_tables(
+    output_dir: Path,
+    portfolio_names: List[str],
+    results: dict,
+    val: int,
+    unit: str,
+    start_date,
+    end_date,
+    freq,
+    rebalance,
+    missing,
+    style: str,
+    amount: float,
+    initial_cap: float,
+    window: int,
+    prices_df: pd.DataFrame,
+    dca_interval: Optional[str] = None,
+    ppy: Optional[int] = None,
+    tax_reports: Optional[dict] = None,
+    rolling_mm_df: Optional[pd.DataFrame] = None,
+    roll_paths_mean: Optional[dict] = None,
+    roll_paths_median: Optional[dict] = None,
+    roll_tax_sums: Optional[dict] = None,
+    tax_win_start=None,
+    tax_win_end=None,
+    typical_value_mean: Optional[dict] = None,
+    typical_value_median: Optional[dict] = None,
+    representative_paths: Optional[dict] = None,
+) -> None:
+    sns.set_theme(style="whitegrid")
+    style_norm = (style or "").lower()
+    is_dca = style_norm == "dca"
+
+    caption = _make_caption(
+        start_date,
+        end_date,
+        freq,
+        rebalance,
+        missing,
+        style,
+        amount,
+        initial_cap,
+        window,
+        ppy=ppy,
+        dca_interval=dca_interval,
+    )
+    if not ppy:
+        ppy = _infer_ppy(freq)
+    n_ports = len(portfolio_names)
+
+    # ---------- (1) Return Distribution ----------
+    plt.figure(figsize=(10, 6))
+    for p in portfolio_names:
+        d = _get_array(results.get(p, {}), ["Return"])
+        if d.size == 0:
+            continue
+        sns.histplot(
+            d * 100,
+            label=p,
+            kde=True,
+            stat="density",
+            common_norm=False,
+            alpha=0.5,
+            bins=50,
+        )
+    try:
+        overall_min = min(
+            float(np.min(_get_array(results.get(p, {}), ["Return"])) * 100)
+            for p in portfolio_names
+            if _get_array(results.get(p, {}), ["Return"]).size > 0
+        )
+        if plt.xlim()[0] > overall_min:
+            plt.xlim(left=max(overall_min - 10, overall_min * 0.9))
+    except ValueError:
+        pass
+    plt.title(
+        f"Rolling Return Distribution ({val} {unit})\n{caption}", fontsize=12, pad=15
+    )
+    plt.xlabel("Return (%)")
+    plt.ylabel("Density")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    save_with_watermarks(output_dir / "return_dist_combined.png")
+
+    # ---------- (2) Return Boxplot ----------
+    plt.figure(figsize=(10, max(4, n_ports * 1.5)))
+    arrs = [
+        (_get_array(results.get(p, {}), ["Return"]) * 100)
+        for p in portfolio_names
+        if _get_array(results.get(p, {}), ["Return"]).size > 0
+    ]
+    if len(arrs) > 0:
+        sns.boxplot(data=arrs, orient="h", palette="Set2", showfliers=False)
+        overall_min = min(float(np.min(a)) for a in arrs)
+        cur_xlim = plt.xlim()
+        plt.xlim(min(overall_min - 15, cur_xlim[0]), cur_xlim[1])
+        ys = [
+            p
+            for p in portfolio_names
+            if _get_array(results.get(p, {}), ["Return"]).size > 0
+        ]
+        for i, p in enumerate(ys):
+            mn = float(np.min(_get_array(results.get(p, {}), ["Return"])) * 100)
+            plt.scatter(mn, i, color="red", marker="x", s=100, zorder=10)
+            plt.text(
+                mn,
+                i - 0.2,
+                f"{mn:.1f}%",
+                color="red",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                fontweight="bold",
+            )
+        plt.yticks(range(len(ys)), ys)
+    plt.title(f"Return Boxplot ({val} {unit})\n{caption}", fontsize=12, pad=15)
+    plt.xlabel("Return (%)")
+    plt.tight_layout()
+    save_with_watermarks(output_dir / "return_boxplot.png")
+
+    # ---------- (3) Win Rate Matrix ----------
+    wr = np.full((n_ports, n_ports), np.nan, dtype=float)
+    for i, p1 in enumerate(portfolio_names):
+        for j, p2 in enumerate(portfolio_names):
+            if i == j:
+                continue
+            r1 = _get_array(results.get(p1, {}), ["Return"])
+            r2 = _get_array(results.get(p2, {}), ["Return"])
+            if r1.size == 0 or r2.size == 0:
+                wr[i, j] = np.nan
+            else:
+                wins = np.sum(r1 > r2)
+                total = min(len(r1), len(r2))
+                wr[i, j] = wins / total if total else np.nan
+    plt.figure(figsize=(max(8, n_ports * 1.5), max(6, n_ports * 1.2)))
+    sns.heatmap(
+        wr * 100,
+        annot=True,
+        fmt=".1f",
+        cmap="RdYlGn",
+        center=50,
+        xticklabels=portfolio_names,
+        yticklabels=portfolio_names,
+        cbar_kws={"label": "Win Rate (%)"},
+    )
+    plt.title(f"Win Rate Matrix (%)[Row > Column]\n{caption}", fontsize=12, pad=15)
+    plt.tight_layout()
+    save_with_watermarks(output_dir / "win_rate_matrix.png")
+
+    # ---------- (4) Performance Summary Table ----------
+    try:
+        use_dca_value_table = is_dca
+        cols_top = (
+            [
+                "Portfolio",
+                "Final(Mean)",
+                "Final(Min)",
+                "Final(25%)",
+                "Final(Med)",
+                "Final(75%)",
+                "Final(Max)",
+            ]
+            if use_dca_value_table
+            else ["Portfolio", "Mean", "Min", "25%", "Median", "75%", "Max"]
+        )
+        rows_top = []
+        for p in portfolio_names:
+            m = results.get(p, {})
+            if use_dca_value_table:
+                fv = _get_array(m, ["Final_Value"])
+                if fv.size == 0:
+                    rows_top.append([p] + ["—"] * (len(cols_top) - 1))
+                else:
+                    rows_top.append(
+                        [
+                            p,
+                            f"{np.mean(fv):,.0f}",
+                            f"{np.min(fv):,.0f}",
+                            f"{np.percentile(fv, 25):,.0f}",
+                            f"{np.median(fv):,.0f}",
+                            f"{np.percentile(fv, 75):,.0f}",
+                            f"{np.max(fv):,.0f}",
+                        ]
+                    )
+            else:
+                r = _get_array(m, ["Return"])
+                if r.size == 0:
+                    rows_top.append([p] + ["—"] * (len(cols_top) - 1))
+                else:
+                    rows_top.append(
+                        [
+                            p,
+                            f"{np.mean(r):.2%}",
+                            f"{np.min(r):.2%}",
+                            f"{np.percentile(r, 25):.2%}",
+                            f"{np.median(r):.2%}",
+                            f"{np.percentile(r, 75):.2%}",
+                            f"{np.max(r):.2%}",
+                        ]
+                    )
+
+        if use_dca_value_table:
+            cols_mid = [
+                "Portfolio",
+                "Path Min(Med)",
+                "Path Max(Med)",
+                "Tot CAGR(Simple, Med)",
+                "IRR(Med)",
+                "Risk(Med)",
+                "Sharpe(Med)",
+                "Max Drawup(Med)",
+                "Max DD(Med)",
+            ]
+        else:
+            cols_mid = [
+                "Portfolio",
+                "Path Min(Med)",
+                "Path Max(Med)",
+                "CAGR(Med)",
+                "Risk(Med)",
+                "Sharpe(Med)",
+                "Max Drawup(Med)",
+                "Max DD(Med)",
+            ]
+        rows_mid = []
+        for p in portfolio_names:
+            m = results.get(p, {})
+            path_min = _get_scalar(m, ["Path_Min", "PathMin"])
+            path_max = _get_scalar(m, ["Path_Max", "PathMax"])
+            cagr_med = _get_scalar(m, ["CAGR"])
+            risk_med = _get_scalar(m, ["Risk"])
+            shrp_med = _get_scalar(m, ["Sharpe"])
+            max_up = _get_scalar(m, ["Max_Drawup", "MaxDrawup"])
+            max_dd = _get_scalar(m, ["Max_DD", "MaxDD"])
+            if not use_dca_value_table:
+                rows_mid.append(
+                    [
+                        p,
+                        f"{path_min:.2f}",
+                        f"{path_max:.2f}",
+                        f"{cagr_med:.2%}",
+                        f"{risk_med:.2%}",
+                        f"{shrp_med:.2f}",
+                        f"{max_up:.2%}",
+                        f"{max_dd:.2%}",
+                    ]
+                )
+            else:
+                fv_med = _get_scalar(m, ["Final_Value"])
+                tot_cagr_simple_med = _get_scalar(m, ["CAGR_Simple"], default=np.nan)
+                irr_med = (
+                    _dca_irr_from_median_fv(
+                        fv_median=fv_med,
+                        window=window,
+                        ppy=ppy,
+                        amount=float(amount or 0.0),
+                        initial_cap=float(initial_cap or 0.0),
+                        dca_interval=(dca_interval or "every_period"),
+                    )
+                    if np.isfinite(fv_med)
+                    else np.nan
+                )
+                rows_mid.append(
+                    [
+                        p,
+                        (f"{path_min:,.0f}" if np.isfinite(path_min) else "—"),
+                        (f"{path_max:,.0f}" if np.isfinite(path_max) else "—"),
+                        (
+                            f"{tot_cagr_simple_med:.2%}"
+                            if np.isfinite(tot_cagr_simple_med)
+                            else "—"
+                        ),
+                        (f"{irr_med:.2%}" if np.isfinite(irr_med) else "—"),
+                        f"{risk_med:.2%}" if np.isfinite(risk_med) else "—",
+                        f"{shrp_med:.2f}" if np.isfinite(shrp_med) else "—",
+                        f"{max_up:.2%}" if np.isfinite(max_up) else "—",
+                        f"{max_dd:.2%}" if np.isfinite(max_dd) else "—",
+                    ]
+                )
+
+        fig = plt.figure(figsize=(21, 9.8))
+        gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3.2, 3.2, 2.0])
+
+        # Top table
+        ax_top = fig.add_subplot(gs[0, 0])
+        ax_top.axis("off")
+        tab_top = ax_top.table(
+            cellText=rows_top, colLabels=cols_top, loc="center", cellLoc="center"
+        )
+        tab_top.auto_set_font_size(False)
+        tab_top.set_fontsize(10)
+        tab_top.scale(1.0, 1.20)
+        for (i, j), cell in tab_top.get_celld().items():
+            if i == 0:
+                cell.set_text_props(weight="bold")
+                cell.set_facecolor("#f0f0f0")
+            elif j == 0:
+                cell.set_text_props(weight="bold")
+            try:
+                fam = (
+                    _CHOSEN_CJK
+                    or (rcParams.get("font.family") or [""])[0]
+                    or "sans-serif"
+                )
+                cell.get_text().set_fontfamily(fam)
+            except Exception:
+                pass
+        cap_mode = "DCA (values)" if use_dca_value_table else "Returns"
+        ax_top.set_title(
+            f"Performance Summary — Top: Mean to Max ({val} {unit}) [{cap_mode}]\n{caption}",
+            fontsize=12,
+            fontweight="bold",
+            pad=1,
+        )
+
+        # Middle table
+        ax_mid = fig.add_subplot(gs[1, 0])
+        ax_mid.axis("off")
+        tab_mid = ax_mid.table(
+            cellText=rows_mid, colLabels=cols_mid, loc="center", cellLoc="center"
+        )
+        tab_mid.auto_set_font_size(False)
+        tab_mid.set_fontsize(10)
+        tab_mid.scale(1.0, 1.20)
+        for (i, j), cell in tab_mid.get_celld().items():
+            if i == 0:
+                cell.set_text_props(weight="bold")
+                cell.set_facecolor("#f0f0f0")
+            elif j == 0:
+                cell.set_text_props(weight="bold")
+            try:
+                fam = (
+                    _CHOSEN_CJK
+                    or (rcParams.get("font.family") or [""])[0]
+                    or "sans-serif"
+                )
+                cell.get_text().set_fontfamily(fam)
+            except Exception:
+                pass
+        ax_mid.set_title(
+            "Middle: Path Min – MaxDD + (CAGR/Risk/Sharpe/Drawups) — medians across rolling windows",
+            fontsize=12,
+            fontweight="bold",
+            pad=1,
+        )
+
+        # Bottom notes
+        ax_bot = fig.add_subplot(gs[2, 0])
+        ax_bot.axis("off")
+        if use_dca_value_table:
+            notes_lines = [
+                "Notes (DCA):",
+                "• Top — Final Value distribution (currency) across rolling windows.",
+                "• Middle — Medians across windows:",
+                " - Path Min/Max (Med): Median of within-window portfolio VALUE min/max (contributions at period start; none at last step).",
+                " - Tot CAGR (Simple, Med): Principal-based annualized rate with total contributed principal (I0 + A × #contrib).",
+                " - IRR (Med): Money-weighted return solved from the median Final Value and the DCA cash-flow schedule.",
+                " - Risk/Sharpe/Max Drawup/Max DD: Computed on price-path basis; drawup/down from normalized paths.",
+                "Assumptions: data freq sets ppy; DCA schedule follows '--dca-interval'; last period has no new contribution.",
+            ]
+        else:
+            notes_lines = [
+                "Notes (Lump Sum):",
+                "• Top — Return distribution (%, rolling windows) across portfolios.",
+                "• Middle — Medians across windows:",
+                " - Path Min/Max (Med): Median of within-window normalized path extrema (start=1).",
+                " - CAGR/Risk/Sharpe: Standard annualization with ppy set by '--freq'.",
+                " - Max Drawup/Max DD: Max cumulative rise/fall from rolling normalized path.",
+            ]
+        notes_text = "\n".join(notes_lines)
+        ax_bot.text(
+            0.01,
+            0.8,
+            notes_text,
+            ha="left",
+            va="top",
+            fontsize=10,
+            linespacing=1.3,
+            transform=ax_bot.transAxes,
+            fontfamily=(
+                _CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif"
+            ),
+        )
+        plt.tight_layout()
+        save_with_watermarks(
+            output_dir / "performance_summary_table_notes.png", bbox_inches="tight"
+        )
+    except Exception:
+        pass
+
+    # ---------- (5) Typical VALUE paths (Mean-only & Median-only) + CSV----------
+    try:
+        tv_mean = typical_value_mean or {}
+        tv_median = typical_value_median or {}
+        L = None
+        for p in portfolio_names:
+            if p in tv_mean:
+                L = len(tv_mean[p])
+                break
+        if L and L > 0:
+            step_arr = np.arange(1, L + 1, dtype=int)
+            contrib = np.zeros(L, dtype=float)
+            if is_dca and amount and amount > 0:
+                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
+                contrib[mask] = float(amount)
+
+            # CSV（従来通り）
+            df_mean = pd.DataFrame({"Step": step_arr, "ContributionPerPeriod": contrib})
+            for p in portfolio_names:
+                if p in tv_mean:
+                    df_mean[p] = tv_mean[p]
+            df_mean.to_csv(
+                output_dir / "typical_value_mean_all_ports.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+            df_median = pd.DataFrame(
+                {"Step": step_arr, "ContributionPerPeriod": contrib}
+            )
+            for p in portfolio_names:
+                if p in tv_median:
+                    df_median[p] = tv_median[p]
+                elif p in tv_mean:
+                    df_median[p] = tv_mean[p]
+            df_median.to_csv(
+                output_dir / "typical_value_median_all_ports.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+            # ---------- Mean (linear) + final labels ----------
+            plt.figure(figsize=(12, 6))
+            ax = plt.gca()
+            if is_dca and amount and amount > 0:
+                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
+                ax2 = ax.twinx()
+                bar_x = np.arange(1, L + 1, dtype=int)[mask]
+                ax2.bar(
+                    bar_x,
+                    np.full(bar_x.shape, float(amount)),
+                    width=0.75,
+                    color="gray",
+                    alpha=0.22,
+                    edgecolor="none",
+                    label="Contribution (schedule)",
+                    zorder=1,
+                )
+                ax2.set_ylabel("Contribution per period")
+
+            for p in portfolio_names:
+                if p in tv_mean:
+                    y = np.asarray(tv_mean[p], dtype=float)
+                    ax.plot(step_arr, y, label=f"{p} Mean", linewidth=1.9, zorder=5)
+                    # final value label
+                    ax.annotate(
+                        f"{y[-1]:,.0f}",
+                        xy=(step_arr[-1], y[-1]),
+                        xytext=(5, 0),
+                        textcoords="offset points",
+                        va="center",
+                        fontsize=9,
+                        color="#333",
+                    )
+
+            ax.set_ylabel("Portfolio value (linear)")
+            ax.set_title(f"Rolling Typical VALUE Path — Mean only\n{caption}")
+            ax.grid(True, linewidth=0.3, alpha=0.5)
+            y_ticks, _ = _year_ticks(L, ppy)
+            ax.set_xticks(y_ticks)
+            ax.set_xticklabels([f"Y{i}" for i in range(1, len(y_ticks) + 1)])
+            if is_dca and amount and amount > 0:
+                lines, labels = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines + lines2, labels + labels2, loc="best")
+            else:
+                ax.legend(loc="best")
+            plt.tight_layout()
+            save_with_watermarks(
+                output_dir / "typical_value_mean_all_ports.png", dpi=100
+            )
+
+            # ---------- Median (linear) + final labels ----------
+            plt.figure(figsize=(12, 6))
+            ax = plt.gca()
+            if is_dca and amount and amount > 0:
+                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
+                ax2 = ax.twinx()
+                bar_x = np.arange(1, L + 1, dtype=int)[mask]
+                ax2.bar(
+                    bar_x,
+                    np.full(bar_x.shape, float(amount)),
+                    width=0.75,
+                    color="gray",
+                    alpha=0.22,
+                    edgecolor="none",
+                    label="Contribution (schedule)",
+                    zorder=1,
+                )
+                ax2.set_ylabel("Contribution per period")
+
+            for p in portfolio_names:
+                if p in tv_median:
+                    y = np.asarray(tv_median[p], dtype=float)
+                    ax.plot(
+                        step_arr,
+                        y,
+                        label=f"{p} Median",
+                        linewidth=1.9,
+                        linestyle="--",
+                        zorder=5,
+                    )
+                    ax.annotate(
+                        f"{y[-1]:,.0f}",
+                        xy=(step_arr[-1], y[-1]),
+                        xytext=(5, 0),
+                        textcoords="offset points",
+                        va="center",
+                        fontsize=9,
+                        color="#333",
+                    )
+                elif p in tv_mean:
+                    y = np.asarray(tv_mean[p], dtype=float)
+                    ax.plot(
+                        step_arr,
+                        y,
+                        label=f"{p} Median(n/a→Mean)",
+                        linewidth=1.9,
+                        linestyle="--",
+                        zorder=5,
+                    )
+                    ax.annotate(
+                        f"{y[-1]:,.0f}",
+                        xy=(step_arr[-1], y[-1]),
+                        xytext=(5, 0),
+                        textcoords="offset points",
+                        va="center",
+                        fontsize=9,
+                        color="#333",
+                    )
+
+            ax.set_ylabel("Portfolio value (linear)")
+            ax.set_title(f"Rolling Typical VALUE Path — Median only\n{caption}")
+            ax.grid(True, linewidth=0.3, alpha=0.5)
+            y_ticks, _ = _year_ticks(L, ppy)
+            ax.set_xticks(y_ticks)
+            ax.set_xticklabels([f"Y{i}" for i in range(1, len(y_ticks) + 1)])
+            if is_dca and amount and amount > 0:
+                lines, labels = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines + lines2, labels + labels2, loc="best")
+            else:
+                ax.legend(loc="best")
+            plt.tight_layout()
+            save_with_watermarks(
+                output_dir / "typical_value_median_all_ports.png", dpi=100
+            )
+    except Exception as e:
+        print("[viz] Typical paths error:", e)
+        pass
+
+    # ---------- (6) Representative percentile paths → STACKED (linear only) + CSV ----------
+    try:
+        reps = representative_paths or {}
+        BLUE = "#1f77b4"  # Principal
+        GREEN = "#2ca02c"  # Profit (>=0)
+        RED = "#d62728"  # Profit (<0)
+
+        # どの程度の密度なら月次/週次に落とすか
+        def _auto_rule(n: int) -> str:
+            if n > 600:
+                return "ME"  # monthly-end (use 'ME' per requirement)
+            if n > 250:
+                return "W"  # weekly-end
+            return "D"
+
+        for p in portfolio_names:
+            paths = reps.get(p, None)
+            if not paths:
+                continue
+            for item in paths:
+                label = item.get("label", "Path")
+                dates = pd.to_datetime(item["dates"])
+                values = np.asarray(item["values"], dtype=float)
+                principal = np.asarray(
+                    item.get("principal", np.zeros_like(values)), dtype=float
+                )
+
+                # native dataframe
+                df = pd.DataFrame(
+                    {"Date": dates, "Principal": principal, "TotalValue": values}
+                ).set_index("Date")
+                df["Profit"] = df["TotalValue"] - df["Principal"]
+
+                # choose plotting rule (月次/週次に間引き)
+                rule = _auto_rule(len(df))
+                # NOTE: Per request, use ("ME","W"); otherwise keep native
+                df_plot = (
+                    df.resample(rule).last().dropna() if rule in ("ME", "W") else df
+                )
+
+                # x & series at plotting resolution
+                dt_index: pd.DatetimeIndex = pd.DatetimeIndex(df_plot.index)
+                idx = dt_index.to_pydatetime()
+                principal_plot = df_plot["Principal"].to_numpy(dtype=float, copy=False)
+                profit = df_plot["Profit"].to_numpy(dtype=float, copy=False)
+                total_plot = df_plot["TotalValue"].to_numpy(dtype=float, copy=False)
+
+                # --- bar width: 隣接最小間隔×0.75。月次なら約20〜22日、週次なら約4日。 ---
+                if len(idx) >= 2:
+                    deltas = (
+                        np.diff(df_plot.index.values)
+                        .astype("timedelta64[D]")
+                        .astype(float)
+                    )
+                    min_gap = float(np.nanmin(deltas))
+                    # 安全域：1日〜(min_gap*0.9)にクランプ、既定は0.75倍
+                    bar_width_days = min(
+                        max(1.0, 0.75 * min_gap), max(1.0, 0.9 * min_gap)
+                    )
+                else:
+                    bar_width_days = 10.0
+
+                pos = profit >= 0
+                neg = profit < 0
+
+                # ---------- STACKED BARS (linear only) ----------
+                plt.figure(figsize=(16, 8))
+                ax = plt.gca()
+                ax.set_facecolor("white")  # 背景は白
+
+                # 先にフラグと bottom を必ず定義
+                pos = profit >= 0
+                neg = profit < 0
+                # 損失（neg）のときは元本（青）を profit の下から積み、総額の高さを維持
+                base_for_principal = np.where(neg, profit, 0.0)
+
+                # 1) 元本（青）— 先に描画して土台にする
+                ax.bar(
+                    idx,
+                    principal_plot,
+                    bottom=base_for_principal,  # neg のときは負の profit を底に
+                    color=BLUE,
+                    width=bar_width_days,
+                    label="Principal",
+                    zorder=1,
+                    alpha=0.65,  # 視認性のためやや薄め
+                    edgecolor="none",
+                    linewidth=0.0,
+                )
+
+                # 2) 利益（緑, profit>=0）
+                if np.any(pos):
+                    ax.bar(
+                        idx[pos],
+                        profit[pos],
+                        bottom=principal_plot[pos],
+                        color=GREEN,
+                        width=bar_width_days,
+                        label="Profit",
+                        zorder=3,
+                        alpha=0.90,
+                        edgecolor="none",
+                        linewidth=0.0,
+                    )
+
+                # 3) 損失（赤, profit<0）— 最後に描いて前面に出す
+                if np.any(neg):
+                    ax.bar(
+                        idx[neg],
+                        profit[neg],  # 負の値 → 自然に 0 より下へ伸びる
+                        color=RED,
+                        width=bar_width_days,
+                        label="Profit (loss)",
+                        zorder=4,  # 一番前面
+                        alpha=1.00,  # 不透明でくっきり
+                        edgecolor="#8b0000",  # お好みで輪郭。不要なら "none"
+                        linewidth=0.3,
+                    )
+
+                # final value label（最終トータル）
+                if len(idx) > 0:
+                    fv = float(total_plot[-1])
+                    ax.annotate(
+                        format_integer_commas(fv),
+                        xy=(idx[-1], total_plot[-1]),
+                        xytext=(8, 6),
+                        textcoords="offset points",
+                        fontsize=10,
+                        color="#222",
+                        bbox=dict(
+                            boxstyle="round,pad=0.2", fc="white", ec="#888", alpha=0.85
+                        ),
+                    )
+
+                # dynamic major year ticks for long spans
+                if len(idx) >= 2:
+                    span_days = (df_plot.index[-1] - df_plot.index[0]).days
+                    total_years = max(1, int(round(span_days / 365.25)))
+                    if total_years <= 20:
+                        base_years = 1
+                    elif total_years <= 50:
+                        base_years = 2
+                    elif total_years <= 100:
+                        base_years = 5
+                    elif total_years <= 200:
+                        base_years = 10
+                    else:
+                        base_years = 20
+                else:
+                    base_years = 1
+
+                ax.set_ylabel('Portfolio Value')
+                # Use compact money units (K/M/B/T) on the y-axis
+                ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+                ax.set_title(f"{p} — {label} VALUE Path (calendar)\n{caption}")
+                ax.xaxis.set_major_locator(mdates.YearLocator(base=base_years))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+                # (optional) minor ticks: show yearly ticks between coarse majors when base_years>1
+                try:
+                    if base_years > 1:
+                        ax.xaxis.set_minor_locator(mdates.YearLocator(base=1))
+                        ax.tick_params(axis="x", which="minor", length=3, labelsize=0)
+                except Exception:
+                    pass
+
+                ax.tick_params(axis="x", labelrotation=0)
+                ax.grid(True, linewidth=0.4, alpha=0.35)
+                ax.legend(loc="best", frameon=True)
+
+                outname_img = f"{_safe_name(p)}_rep_{label.replace('%', 'P').replace(' ', '')}_stacked.png"
+                plt.tight_layout()
+                save_with_watermarks(output_dir / outname_img, dpi=100)
+
+                # ---------- CSV（従来のネイティブ＋プロット後の2種） ----------
+                cmask = item.get("contrib_mask", None)
+                contrib_made = (
+                    cmask.astype(int)
+                    if isinstance(cmask, np.ndarray)
+                    else np.zeros(len(values), dtype=int)
+                )
+                df_native = pd.DataFrame(
+                    {
+                        "Date": pd.to_datetime(dates),
+                        "Principal": principal,
+                        "Profit": values - principal,
+                        "TotalValue": values,
+                        "ContributionMade(0/1)": contrib_made,
+                        "Label": label,
+                        "Portfolio": p,
+                    }
+                )
+                outname_csv_native = f"rep_{_safe_name(p)}_{label.replace('%', 'P').replace(' ', '')}_value_path.csv"
+                df_native.to_csv(
+                    output_dir / outname_csv_native, index=False, encoding="utf-8-sig"
+                )
+
+                df_plot_out = df_plot.reset_index()
+                df_plot_out.insert(0, "Portfolio", p)
+                df_plot_out.insert(1, "Label", label)
+                df_plot_out["PlotResampleRule"] = rule
+                df_plot_out["BarWidthDays"] = bar_width_days
+                outname_csv_plot = f"rep_{_safe_name(p)}_{label.replace('%', 'P').replace(' ', '')}_value_path_plot.csv"
+                df_plot_out.rename(columns={"Date": "Date"}).to_csv(
+                    output_dir / outname_csv_plot, index=False, encoding="utf-8-sig"
+                )
+    except Exception as e:
+        print("[viz] Representative stacked bars error:", e)
+        pass
+
+    # ---------- (7) Taxes: summary + time series (unchanged) ----------
+    try:
+        if tax_reports and isinstance(tax_reports, dict):
+            cols = [
+                "Portfolio",
+                "Tax Rate",
+                "Events",
+                "Total Tax",
+                "Avg per event",
+                "Max single event",
+            ]
+            data_rows = []
+            for p in portfolio_names:
+                rep = tax_reports.get(p, {})
+                rate = rep.get("tax_rate", None)
+                rate_str = (
+                    f"{float(rate):.2%}" if isinstance(rate, (int, float)) else "—"
+                )
+                events = rep.get("tax_events", 0)
+                total = rep.get("total_tax", None)
+                avg_ev = rep.get("avg_tax_per_event", None)
+                max_one = rep.get("max_tax_single_event", None)
+                if int(events or 0) <= 0:
+                    data_rows.append(
+                        [p, rate_str, "0 (no taxable sells)", "—", "—", "—"]
+                    )
+                else:
+                    data_rows.append(
+                        [
+                            p,
+                            rate_str,
+                            f"{int(events)}",
+                            (f"{float(total):.6f}" if total is not None else "—"),
+                            (f"{float(avg_ev):.6f}" if avg_ev is not None else "—"),
+                            (f"{float(max_one):.6f}" if max_one is not None else "—"),
+                        ]
+                    )
+
+            fig, ax = plt.subplots(figsize=(14, 1.2 + 0.5 * max(1, len(data_rows))))
+            ax.axis("off")
+            tab = ax.table(
+                cellText=data_rows, colLabels=cols, loc="center", cellLoc="center"
+            )
+            tab.auto_set_font_size(False)
+            tab.set_fontsize(10)
+            tab.scale(1.0, 1.35)
+            for (i, j), cell in tab.get_celld().items():
+                if i == 0:
+                    cell.set_text_props(weight="bold")
+                    cell.set_facecolor("#f0f0f0")
+                elif j == 0:
+                    cell.set_text_props(weight="bold")
+                try:
+                    fam = (
+                        _CHOSEN_CJK
+                        or (rcParams.get("font.family") or [""])[0]
+                        or "sans-serif"
+                    )
+                    cell.get_text().set_fontfamily(fam)
+                except Exception:
+                    pass
+            fig.suptitle(
+                "Tax Summary (at Rebalance Events)", fontsize=12, fontweight="bold"
+            )
+            fig.text(
+                0.5,
+                0.03,
+                "Rows with no taxable rebalancing activity are displayed as '—'.",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                fontfamily=(
+                    _CHOSEN_CJK
+                    or (rcParams.get("font.family") or [""])[0]
+                    or "sans-serif"
+                ),
+            )
+            fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+            save_with_watermarks(
+                output_dir / "tax_summary_table.png", bbox_inches="tight"
+            )
+
+            n = len(portfolio_names)
+            fig2, axes = plt.subplots(
+                nrows=n, ncols=1, figsize=(14, max(2.5, 2.2 * n)), sharex=True
+            )
+            if n == 1:
+                axes = [axes]
+            f = str(freq or "").lower()
+            for ax, p in zip(axes, portfolio_names):
+                rep = tax_reports.get(p, {})
+                s = rep.get("tax_paid_series", None)
+                if s is None:
+                    ax.set_title(f"{p}: (no tax series)")
+                    ax.set_ylabel("Tax")
+                    continue
+                s = s.copy()
+                s.index = pd.to_datetime(s.index)
+                if f in ("", "daily", "day"):
+                    s_plot = s.resample("ME").sum()
+                    subtitle = "(monthly sum, daily data)"
+                else:
+                    s_plot = s
+                    subtitle = ""
+                ax.bar(
+                    s_plot.index,
+                    s_plot.values,
+                    width=20 if f in ("", "daily", "day") else 10,
+                    color="#cc6666",
+                )
+                ax.set_title(f"{p} — Taxes Paid Over Time {subtitle}")
+                ax.set_ylabel("Tax")
+                ax.grid(True, axis="y", alpha=0.3)
+            axes[-1].set_xlabel("Date")
+            plt.tight_layout()
+            save_with_watermarks(output_dir / "tax_paid_time_series.png")
+    except Exception:
+        pass
+
+    # ---------- (8) Taxes: rolling-window table (unchanged) ----------
+    try:
+        if roll_tax_sums and isinstance(roll_tax_sums, dict):
+            rows = []
+            cols = [
+                "Portfolio",
+                "Tax Sum (Med)",
+                "Tax Sum (25%)",
+                "Tax Sum (75%)",
+                "Tax Sum (Min)",
+                "Tax Sum (Max)",
+            ]
+            for p in portfolio_names:
+                v = _get_array({"v": roll_tax_sums.get(p, np.array([]))}, ["v"])
+                ev = 0
+                if tax_reports and isinstance(tax_reports, dict):
+                    rep = tax_reports.get(p, {})
+                    try:
+                        ev = int(rep.get("tax_events", 0) or 0)
+                    except Exception:
+                        ev = 0
+                if ev == 0 or v.size == 0 or np.allclose(v, 0.0):
+                    rows.append([p, "—", "—", "—", "—", "—"])
+                    continue
+                rows.append(
+                    [
+                        p,
+                        f"{np.median(v):.6f}",
+                        f"{np.percentile(v, 25):.6f}",
+                        f"{np.percentile(v, 75):.6f}",
+                        f"{np.min(v):.6f}",
+                        f"{np.max(v):.6f}",
+                    ]
+                )
+            plt.figure(figsize=(14, 1.2 + 0.5 * max(1, len(rows))))
+            ax = plt.gca()
+            ax.axis("off")
+            tab = ax.table(
+                cellText=rows, colLabels=cols, loc="center", cellLoc="center"
+            )
+            tab.auto_set_font_size(False)
+            tab.set_fontsize(10)
+            tab.scale(1.0, 1.35)
+            for (i, j), cell in tab.get_celld().items():
+                if i == 0:
+                    cell.set_text_props(weight="bold")
+                    cell.set_facecolor("#f0f0f0")
+                elif j == 0:
+                    cell.set_text_props(weight="bold")
+                try:
+                    fam = (
+                        _CHOSEN_CJK
+                        or (rcParams.get("font.family") or [""])[0]
+                        or "sans-serif"
+                    )
+                    cell.get_text().set_fontfamily(fam)
+                except Exception:
+                    pass
+            main_title = f"Rolling Taxes Summary (window={window} periods)"
+            ax.set_title(main_title, fontsize=12, fontweight="bold", pad=10)
+            ax.text(
+                0.5,
+                0.02,
+                "Note: '—' indicates no taxable rebalancing sells in the period (or across rolling windows).",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                transform=ax.transAxes,
+                fontfamily=(
+                    _CHOSEN_CJK
+                    or (rcParams.get("font.family") or [""])[0]
+                    or "sans-serif"
+                ),
+            )
+            plt.tight_layout()
+            save_with_watermarks(
+                output_dir / "rolling_tax_summary_table.png", bbox_inches="tight"
+            )
+    except Exception:
+        pass
