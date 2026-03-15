@@ -1,6 +1,137 @@
 
 # src/commands/compare_actual_vs_simulated.py
 from __future__ import annotations
+
+"""
+Generate simulated daily price series for leveraged S&P 500 ETFs.
+
+This module provides a command-line entry point for creating synthetic daily
+historical price series for leveraged S&P 500 ETFs such as:
+
+* ``SSO`` (2x leverage)
+* ``SPXL`` (3x leverage)
+
+The simulation combines:
+
+* a daily S&P 500 price series,
+* monthly S&P 500 dividend yield data converted to daily frequency, and
+* monthly short-term risk-free rate data converted to daily frequency.
+
+The simulated return stream applies leveraged daily exposure to the underlying
+index, optionally includes dividend carry, subtracts financing/borrowing costs
+for the leveraged portion, and subtracts an annual fixed cost assumption.
+
+The resulting CSV outputs are intended for research, backtesting, and long-run
+historical reconstruction where the live ETF history is shorter than the period
+being analyzed.
+
+Return model
+------------
+For each observation step ``t``, the simulated leveraged ETF return is modeled
+as a daily-reset leveraged return on the S&P 500, with optional dividend carry,
+borrowing cost, and annual fee drag.
+
+When ``include_dividends=True``, the simulated step return is:
+
+    r_sim,t
+    = L * r_spx,t
+    + L * d_ann,t * dt_t
+    - (L - 1) * (alpha * rf_ann,t + beta) * dt_t
+    - cost_annual * dt_t
+
+where:
+
+    * ``r_sim,t`` is the simulated leveraged ETF return at step ``t``.
+    * ``L`` is the leverage multiplier (for example, 2 for SSO or 3 for SPXL).
+    * ``r_spx,t`` is the S&P 500 price return at step ``t``:
+          r_spx,t = Price_t / Price_(t-1) - 1
+    * ``d_ann,t`` is the annualized dividend yield aligned to date ``t``.
+    * ``rf_ann,t`` is the annualized risk-free rate aligned to date ``t``.
+    * ``alpha`` is the borrowing-rate multiplier (``borrow_alpha`` in code).
+    * ``beta`` is the additional annualized borrowing spread
+      (``borrow_beta`` in code).
+    * ``cost_annual`` is the annual fixed fee / expense drag.
+    * ``dt_t`` is the elapsed time from the previous observation to the current
+      one, expressed in years.
+
+This can also be written in grouped form as:
+
+    carry_ann,t = L * d_ann,t - (L - 1) * (alpha * rf_ann,t + beta)
+
+    r_sim,t = L * r_spx,t + carry_ann,t * dt_t - cost_annual * dt_t
+
+Economic interpretation
+-----------------------
+The model decomposes each ETF step return into four components:
+
+1. Leveraged index price return
+   ``L * r_spx,t``
+
+   This is the main driver of the ETF return. The ETF is assumed to deliver
+   ``L`` times the daily S&P 500 price move.
+
+2. Leveraged dividend contribution
+   ``L * d_ann,t * dt_t``
+
+   Because the ETF is modeled as having ``L`` times exposure to the underlying
+   index, the dividend contribution is also scaled by ``L``. Since the dividend
+   input is annualized, it must be multiplied by ``dt_t`` to convert it into
+   a return contribution for the current step.
+
+3. Financing cost on the leveraged portion
+   ``(L - 1) * (alpha * rf_ann,t + beta) * dt_t``
+
+   Only the exposure above 1x is assumed to require financing. Therefore, the
+   borrowing cost is applied to ``L - 1`` times notional exposure rather than
+   the full ``L`` times exposure.
+
+4. Fixed annual fee / management cost
+   ``cost_annual * dt_t``
+
+   This represents the ETF's annual expense drag or other fixed annual cost,
+   converted into a step-level deduction.
+
+Definition of ``dt``
+--------------------
+In the implementation, ``dt`` is computed as:
+
+    dt = (date.diff().dt.days.fillna(0)).astype(float) / 365.0
+
+This means:
+
+* ``date.diff().dt.days`` computes the number of calendar days between the
+  current observation and the previous one.
+* ``fillna(0)`` sets the first row to 0 because it has no previous date.
+* Division by ``365.0`` converts elapsed days into a fraction of a year.
+
+For example:
+
+* If two observations are 1 day apart, ``dt = 1 / 365``.
+* If two observations are 3 days apart (for example, over a weekend),
+  ``dt = 3 / 365``.
+
+Accordingly, ``dt`` should be interpreted as:
+
+    "the fraction of one year represented by the current observation interval"
+
+Why annualized inputs are multiplied by ``dt``
+----------------------------------------------
+Dividend yield, risk-free rate, borrowing spread, and fixed cost are all
+expressed in annualized form. They cannot be added directly to a daily return.
+Multiplying by ``dt`` converts each annualized quantity into the additive return
+or cost contribution for the current observation interval.
+
+Notes
+-----
+* This model assumes **daily reset leverage**.
+* Borrowing cost is modeled as ``borrow_alpha * risk_free + borrow_beta``.
+* The implementation uses a simple additive conversion from annualized rates to
+  step-level contributions by multiplying each annual rate by ``dt``.
+* Long-horizon leveraged ETF performance will therefore differ from simply
+  multiplying cumulative index returns by 2 or 3.
+* Output filenames are self-describing and encode dividend mode, annual cost,
+  borrow parameters, and covered date range.
+"""
 import argparse
 import re
 from dataclasses import dataclass
@@ -52,6 +183,23 @@ def _find_latest_in_data(glob_pattern: str) -> Path:
 
 @dataclass
 class SimMeta:
+    """Metadata parsed from a simulated series filename.
+
+    Attributes
+    ----------
+    path : Path
+        File location.
+    div_tag : str | None
+        Simulation mode label parsed from the filename (``"TR"``/``"PX"``) if
+        present; otherwise ``None``.
+    cost_annual : float
+        Annual cost (as a fraction, not percent). For example, ``0.004`` means
+        ``0.4%/yr``.
+    borrow_alpha : float | None
+        Optional alpha parameter for borrowing model (dimensionless).
+    borrow_beta_annual : float | None
+        Optional annual beta parameter for borrowing model (as a fraction).
+    """
     path: Path
     div_tag: Optional[str]
     cost_annual: float
@@ -213,6 +361,30 @@ def _plot_normalized(symbol: str, res: CompareResult, outdir: Path) -> Path:
 
 
 def _run_for_symbol(symbol: str, actual_glob: str, sim_prefix: str, outdir: Path) -> CompareResult:
+    """Run the full comparison pipeline for one symbol and save charts.
+
+    Steps:
+    1. Discover the latest matching actual and simulated CSVs.
+    2. Load, canonicalize, and align both series on their overlapping dates.
+    3. Compute MAE and final divergence metrics.
+    4. Produce and save the two charts under ``outdir``.
+
+    Parameters
+    ----------
+    symbol : str
+        Ticker symbol for labeling.
+    actual_glob : str
+        Glob pattern to find the actual CSV (relative to ``DATA_DIR``).
+    sim_prefix : str
+        Filename prefix for simulated CSV discovery (relative to ``DATA_DIR``).
+    outdir : Path
+        Output directory where images will be written.
+
+    Returns
+    -------
+    CompareResult
+        Detailed results and aligned DataFrame.
+    """
     actual_path = _find_latest_in_data(actual_glob)
     actual_meta = _parse_actual_filename_tag(actual_path)
     sim_meta = _latest_simulated(sim_prefix)
@@ -233,6 +405,19 @@ def _run_for_symbol(symbol: str, actual_glob: str, sim_prefix: str, outdir: Path
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Parameters
+    ----------
+    argv : list[str] | None, optional
+        Argument vector (``sys.argv[1:]``-like). When ``None``, the function
+        will parse process arguments.
+
+    Returns
+    -------
+    int
+        Process exit code (``0`` on success).
+    """
     ap = argparse.ArgumentParser()
     default_outdir = Path(OUTPUT_DIR / Path('compare')).resolve()
     ap.add_argument("--outdir", type=str, default=str(default_outdir), help="Directory to save charts")
@@ -246,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[warn] No CJK font found. You may see missing-glyph warnings.")
 
     outdir = Path(args.outdir)
+    print(f'save to: {outdir}')
     if "SPXL" in args.symbols:
         _run_for_symbol("SPXL", "SPXL_*_daily_*.csv", "^spxl_simulated_d", outdir)
     if "SSO" in args.symbols:

@@ -308,7 +308,178 @@ def _dca_irr_from_median_fv(
             hi, fhi = mid, fm
     return float(0.5 * (lo + hi))
 
+# =============================================================================
+# Excel export helper for Performance Summary Table + Notes
+# =============================================================================
+def export_performance_summary_to_excel(
+    output_dir: Path,
+    filename: str,
+    *,
+    cols_top: list,
+    rows_top: list,
+    cols_mid: list,
+    rows_mid: list,
+    notes_lines: list,
+    caption: str,
+    meta: dict,
+    numeric_payload: Optional[dict] = None,
+) -> Path:
+    """
+    Write a single-sheet Excel workbook that mirrors
+    'performance_summary_table_notes.png'. Everything is written into a
+    single worksheet named 'Summary' in English.
 
+    Layout:
+      A top title -> Top table -> Middle table -> Notes -> Caption -> Parameters
+
+    Number formats are applied per column label where available.
+    """
+    import pandas as _pd
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xls_path = output_dir / filename
+
+    # Build DataFrames (prefer numeric payload to preserve types)
+    if numeric_payload and isinstance(numeric_payload, dict):
+        df_top = numeric_payload.get("df_top_num")
+        df_mid = numeric_payload.get("df_mid_num")
+        top_number_formats = numeric_payload.get("top_number_formats")
+        mid_number_formats = numeric_payload.get("mid_number_formats")
+    else:
+        df_top = None
+        df_mid = None
+        top_number_formats = None
+        mid_number_formats = None
+
+    if df_top is None:
+        df_top = _pd.DataFrame(rows_top, columns=cols_top)
+    if df_mid is None:
+        df_mid = _pd.DataFrame(rows_mid, columns=cols_mid)
+
+    df_params = _pd.DataFrame(
+        sorted([(k, v) for k, v in meta.items()], key=lambda x: x[0]),
+        columns=["Key", "Value"],
+    )
+
+    def _apply_number_formats(ws, header_row_idx: int, start_col_idx: int, number_formats: dict | None):
+        if not number_formats:
+            return
+        # Map header text -> column index within the sheet
+        headers = {}
+        row = ws[header_row_idx]
+        for j, cell in enumerate(row, start=1):
+            if j < start_col_idx:
+                continue
+            val = cell.value
+            if val is None:
+                continue
+            headers[str(val)] = cell.column
+        # Apply formats under each matching header
+        max_row = ws.max_row
+        for label, fmt in number_formats.items():
+            col_idx = headers.get(label)
+            if not col_idx:
+                continue
+            for r in range(header_row_idx + 1, max_row + 1):
+                ws.cell(row=r, column=col_idx).number_format = fmt
+
+    def _style_header_row(ws, header_row_idx: int, start_col_idx: int, end_col_idx: int):
+        header_fill = PatternFill("solid", fgColor="F0F0F0")
+        for c in range(start_col_idx, end_col_idx + 1):
+            cell = ws.cell(row=header_row_idx, column=c)
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+
+    def _auto_column_widths(ws):
+        # Best-effort auto-width; clamp to [10, 60]
+        for col_idx, col in enumerate(ws.columns, start=1):
+            max_len = 0
+            col_letter = get_column_letter(col_idx)
+            for cell in col:
+                v = cell.value
+                l = len(str(v)) if v is not None else 0
+                if l > max_len:
+                    max_len = l
+            ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
+
+    with _pd.ExcelWriter(xls_path, engine="openpyxl", mode="w") as writer:
+        # Create the single summary sheet
+        wb = writer.book
+        # Remove default sheet if present
+        if wb.worksheets and wb.worksheets[0].title == 'Sheet' and len(wb.worksheets) == 1:
+            wb.remove(wb.worksheets[0])
+        ws = wb.create_sheet(title="Summary")
+        writer.sheets["Summary"] = ws
+
+        current_row = 1
+        # Title
+        ws.cell(row=current_row, column=1, value="Performance Summary (Top + Middle + Notes + Parameters)")
+        ws.cell(row=current_row, column=1).font = Font(bold=True, size=14)
+        current_row += 2
+
+        # --- Top table ---
+        ws.cell(row=current_row, column=1, value="Top — Distribution Summary")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        current_row += 1
+        df_top.to_excel(writer, sheet_name="Summary", index=False, startrow=current_row - 1, startcol=0)
+        header_row_top = current_row
+        start_col_top = 1
+        end_col_top = start_col_top + len(df_top.columns) - 1
+        current_row += len(df_top) + 2
+
+        # --- Middle table ---
+        ws.cell(row=current_row, column=1, value="Middle — Path/CAGR/Risk/Sharpe/Drawups (medians across rolling windows)")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        current_row += 1
+        df_mid.to_excel(writer, sheet_name="Summary", index=False, startrow=current_row - 1, startcol=0)
+        header_row_mid = current_row
+        start_col_mid = 1
+        end_col_mid = start_col_mid + len(df_mid.columns) - 1
+        current_row += len(df_mid) + 2
+
+        # --- Notes ---
+        ws.cell(row=current_row, column=1, value="Notes:")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        current_row += 1
+        for line in notes_lines:
+            ws.cell(row=current_row, column=1, value=line)
+            current_row += 1
+        current_row += 1
+
+        # --- Caption ---
+        ws.cell(row=current_row, column=1, value="Caption:")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        # Place caption in merged cells to span a few columns
+        ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=max(end_col_top, end_col_mid))
+        ws.cell(row=current_row, column=2, value=caption).alignment = Alignment(wrap_text=True, vertical='top')
+        current_row += 2
+
+        # --- Parameters ---
+        ws.cell(row=current_row, column=1, value="Parameters:")
+        ws.cell(row=current_row, column=1).font = Font(bold=True)
+        current_row += 1
+        df_params.to_excel(writer, sheet_name="Summary", index=False, startrow=current_row - 1, startcol=0)
+        header_row_params = current_row
+        end_col_params = 2
+        current_row += len(df_params) + 1
+
+        # Freeze pane just below the big title
+        ws.freeze_panes = 'A3'
+
+        # Style headers and apply number formats per-block
+        _style_header_row(ws, header_row_top, start_col_top, end_col_top)
+        _style_header_row(ws, header_row_mid, start_col_mid, end_col_mid)
+        _style_header_row(ws, header_row_params, 1, end_col_params)
+
+        _apply_number_formats(ws, header_row_top, start_col_top, top_number_formats)
+        _apply_number_formats(ws, header_row_mid, start_col_mid, mid_number_formats)
+
+        # Auto column widths after all content is written
+        _auto_column_widths(ws)
+
+    return xls_path
 # =============================================================================
 # Console tables (English labels)
 # =============================================================================
@@ -662,8 +833,11 @@ def save_charts_and_tables(
     save_with_watermarks(output_dir / "win_rate_matrix.png")
 
     # ---------- (4) Performance Summary Table ----------
+    # ---------- (4) Performance Summary Table ----------
     try:
         use_dca_value_table = is_dca
+
+        # ---- Top table (text for PNG) + numeric rows (for Excel) ----
         cols_top = (
             [
                 "Portfolio",
@@ -677,13 +851,16 @@ def save_charts_and_tables(
             if use_dca_value_table
             else ["Portfolio", "Mean", "Min", "25%", "Median", "75%", "Max"]
         )
-        rows_top = []
+        rows_top: list[list[str]] = []
+        rows_top_num: list[list[Optional[float]]] = []  # numeric values for Excel
+
         for p in portfolio_names:
             m = results.get(p, {})
             if use_dca_value_table:
                 fv = _get_array(m, ["Final_Value"])
                 if fv.size == 0:
                     rows_top.append([p] + ["—"] * (len(cols_top) - 1))
+                    rows_top_num.append([p, None, None, None, None, None, None])
                 else:
                     rows_top.append(
                         [
@@ -696,10 +873,22 @@ def save_charts_and_tables(
                             f"{np.max(fv):,.0f}",
                         ]
                     )
+                    rows_top_num.append(
+                        [
+                            p,
+                            float(np.mean(fv)),
+                            float(np.min(fv)),
+                            float(np.percentile(fv, 25)),
+                            float(np.median(fv)),
+                            float(np.percentile(fv, 75)),
+                            float(np.max(fv)),
+                        ]
+                    )
             else:
                 r = _get_array(m, ["Return"])
                 if r.size == 0:
                     rows_top.append([p] + ["—"] * (len(cols_top) - 1))
+                    rows_top_num.append([p, None, None, None, None, None, None])
                 else:
                     rows_top.append(
                         [
@@ -712,7 +901,19 @@ def save_charts_and_tables(
                             f"{np.max(r):.2%}",
                         ]
                     )
+                    rows_top_num.append(
+                        [
+                            p,
+                            float(np.mean(r)),
+                            float(np.min(r)),
+                            float(np.percentile(r, 25)),
+                            float(np.median(r)),
+                            float(np.percentile(r, 75)),
+                            float(np.max(r)),
+                        ]
+                    )
 
+        # ---- Middle table (text for PNG) + numeric rows (for Excel) ----
         if use_dca_value_table:
             cols_mid = [
                 "Portfolio",
@@ -736,7 +937,10 @@ def save_charts_and_tables(
                 "Max Drawup(Med)",
                 "Max DD(Med)",
             ]
-        rows_mid = []
+
+        rows_mid: list[list[str]] = []
+        rows_mid_num: list[list[Optional[float]]] = []
+
         for p in portfolio_names:
             m = results.get(p, {})
             path_min = _get_scalar(m, ["Path_Min", "PathMin"])
@@ -746,6 +950,7 @@ def save_charts_and_tables(
             shrp_med = _get_scalar(m, ["Sharpe"])
             max_up = _get_scalar(m, ["Max_Drawup", "MaxDrawup"])
             max_dd = _get_scalar(m, ["Max_DD", "MaxDD"])
+
             if not use_dca_value_table:
                 rows_mid.append(
                     [
@@ -759,9 +964,32 @@ def save_charts_and_tables(
                         f"{max_dd:.2%}",
                     ]
                 )
+                rows_mid_num.append(
+                    [
+                        p,
+                        float(path_min) if np.isfinite(path_min) else None,
+                        float(path_max) if np.isfinite(path_max) else None,
+                        float(cagr_med) if np.isfinite(cagr_med) else None,
+                        float(risk_med) if np.isfinite(risk_med) else None,
+                        float(shrp_med) if np.isfinite(shrp_med) else None,
+                        float(max_up) if np.isfinite(max_up) else None,
+                        float(max_dd) if np.isfinite(max_dd) else None,
+                    ]
+                )
             else:
                 fv_med = _get_scalar(m, ["Final_Value"])
                 tot_cagr_simple_med = _get_scalar(m, ["CAGR_Simple"], default=np.nan)
+                if (not np.isfinite(tot_cagr_simple_med)) and np.isfinite(fv_med):
+                    years = float(window) / float(ppy)
+                    principal_window = float(initial_cap) + float(amount) * int(
+                        _contrib_mask_for_window(
+                            window, ppy, dca_interval or "every_period"
+                        ).sum()
+                    )
+                    if principal_window > 0 and years > 0:
+                        base = max(fv_med / principal_window, 1e-12)
+                        tot_cagr_simple_med = np.power(base, 1.0 / years) - 1.0
+
                 irr_med = (
                     _dca_irr_from_median_fv(
                         fv_median=fv_med,
@@ -774,6 +1002,7 @@ def save_charts_and_tables(
                     if np.isfinite(fv_med)
                     else np.nan
                 )
+
                 rows_mid.append(
                     [
                         p,
@@ -791,11 +1020,27 @@ def save_charts_and_tables(
                         f"{max_dd:.2%}" if np.isfinite(max_dd) else "—",
                     ]
                 )
+                rows_mid_num.append(
+                    [
+                        p,
+                        float(path_min) if np.isfinite(path_min) else None,
+                        float(path_max) if np.isfinite(path_max) else None,
+                        float(tot_cagr_simple_med)
+                        if np.isfinite(tot_cagr_simple_med)
+                        else None,
+                        float(irr_med) if np.isfinite(irr_med) else None,
+                        float(risk_med) if np.isfinite(risk_med) else None,
+                        float(shrp_med) if np.isfinite(shrp_med) else None,
+                        float(max_up) if np.isfinite(max_up) else None,
+                        float(max_dd) if np.isfinite(max_dd) else None,
+                    ]
+                )
 
+        # ---- build PNG (unchanged) ----
         fig = plt.figure(figsize=(21, 9.8))
         gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3.2, 3.2, 2.0])
 
-        # Top table
+        # Top
         ax_top = fig.add_subplot(gs[0, 0])
         ax_top.axis("off")
         tab_top = ax_top.table(
@@ -812,9 +1057,9 @@ def save_charts_and_tables(
                 cell.set_text_props(weight="bold")
             try:
                 fam = (
-                    _CHOSEN_CJK
-                    or (rcParams.get("font.family") or [""])[0]
-                    or "sans-serif"
+                        _CHOSEN_CJK
+                        or (rcParams.get("font.family") or [""])[0]
+                        or "sans-serif"
                 )
                 cell.get_text().set_fontfamily(fam)
             except Exception:
@@ -827,7 +1072,7 @@ def save_charts_and_tables(
             pad=1,
         )
 
-        # Middle table
+        # Middle
         ax_mid = fig.add_subplot(gs[1, 0])
         ax_mid.axis("off")
         tab_mid = ax_mid.table(
@@ -844,9 +1089,9 @@ def save_charts_and_tables(
                 cell.set_text_props(weight="bold")
             try:
                 fam = (
-                    _CHOSEN_CJK
-                    or (rcParams.get("font.family") or [""])[0]
-                    or "sans-serif"
+                        _CHOSEN_CJK
+                        or (rcParams.get("font.family") or [""])[0]
+                        or "sans-serif"
                 )
                 cell.get_text().set_fontfamily(fam)
             except Exception:
@@ -892,13 +1137,104 @@ def save_charts_and_tables(
             linespacing=1.3,
             transform=ax_bot.transAxes,
             fontfamily=(
-                _CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif"
+                    _CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif"
             ),
         )
+
         plt.tight_layout()
         save_with_watermarks(
             output_dir / "performance_summary_table_notes.png", bbox_inches="tight"
         )
+
+        # ===== NEW: Excel export (mirrors the same content) =====
+
+        # Meta for reproducibility
+        meta = {
+            "freq": str(freq),
+            "rebalance": str(rebalance),
+            "missing": str(missing),
+            "style": str(style),
+            "dca_interval": str(dca_interval or "every_period"),
+            "amount_per_period": float(amount),
+            "initial_cap": float(initial_cap),
+            "window_periods": int(window),
+            "ppy": int(ppy) if ppy else None,
+            "unit": str(unit),
+            "val": int(val),
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+        }
+
+        # Numeric DataFrames + number formats
+        df_top_num = pd.DataFrame(rows_top_num, columns=cols_top)
+        df_mid_num = pd.DataFrame(rows_mid_num, columns=cols_mid)
+
+        if use_dca_value_table:
+            top_number_formats = {
+                "Final(Mean)": "#,##0",
+                "Final(Min)": "#,##0",
+                "Final(25%)": "#,##0",
+                "Final(Med)": "#,##0",
+                "Final(75%)": "#,##0",
+                "Final(Max)": "#,##0",
+            }
+            mid_number_formats = {
+                "Path Min(Med)": "#,##0",
+                "Path Max(Med)": "#,##0",
+                "Tot CAGR(Simple, Med)": "0.00%",
+                "IRR(Med)": "0.00%",
+                "Risk(Med)": "0.00%",
+                "Sharpe(Med)": "0.00",
+                "Max Drawup(Med)": "0.00%",
+                "Max DD(Med)": "0.00%",
+            }
+        else:
+            top_number_formats = {
+                "Mean": "0.00%",
+                "Min": "0.00%",
+                "25%": "0.00%",
+                "Median": "0.00%",
+                "75%": "0.00%",
+                "Max": "0.00%",
+            }
+            mid_number_formats = {
+                "Path Min(Med)": "0.00",
+                "Path Max(Med)": "0.00",
+                "CAGR(Med)": "0.00%",
+                "Risk(Med)": "0.00%",
+                "Sharpe(Med)": "0.00",
+                "Max Drawup(Med)": "0.00%",
+                "Max DD(Med)": "0.00%",
+            }
+
+        numeric_payload = {
+            "df_top_num": df_top_num,
+            "df_mid_num": df_mid_num,
+            "top_number_formats": top_number_formats,
+            "mid_number_formats": mid_number_formats,
+        }
+
+        try:
+            export_performance_summary_to_excel(
+                output_dir,
+                filename="performance_summary_table_notes.xlsx",
+                cols_top=cols_top,
+                rows_top=rows_top,
+                cols_mid=cols_mid,
+                rows_mid=rows_mid,
+                notes_lines=notes_lines,
+                caption=caption,
+                meta=meta,
+                numeric_payload=numeric_payload,
+            )
+        except ImportError as e:
+            print(
+                "[viz] Excel export skipped: 'openpyxl' is not installed. Install it and re-run.",
+                e,
+            )
+        except Exception as e:
+            print("[viz] Excel export error:", e)
+
     except Exception:
         pass
 
@@ -991,7 +1327,7 @@ def save_charts_and_tables(
                 ax.legend(loc="best")
             plt.tight_layout()
             save_with_watermarks(
-                output_dir / "typical_value_mean_all_ports.png", dpi=100
+                output_dir / "typical_value_mean_all_ports.png", dpi=150
             )
 
             # ---------- Median (linear) + final labels ----------
@@ -1067,7 +1403,7 @@ def save_charts_and_tables(
                 ax.legend(loc="best")
             plt.tight_layout()
             save_with_watermarks(
-                output_dir / "typical_value_median_all_ports.png", dpi=100
+                output_dir / "typical_value_median_all_ports.png", dpi=150
             )
     except Exception as e:
         print("[viz] Typical paths error:", e)
@@ -1245,7 +1581,7 @@ def save_charts_and_tables(
 
                 outname_img = f"{_safe_name(p)}_rep_{label.replace('%', 'P').replace(' ', '')}_stacked.png"
                 plt.tight_layout()
-                save_with_watermarks(output_dir / outname_img, dpi=100)
+                save_with_watermarks(output_dir / outname_img, dpi=150)
 
                 # ---------- CSV（従来のネイティブ＋プロット後の2種） ----------
                 cmask = item.get("contrib_mask", None)
