@@ -97,6 +97,32 @@ INVESTMENT_PERIOD_UNIT = "years"
 INVESTMENT_STYLE = "dca"
 INITIAL_CAPITAL = 0
 DCA_AMOUNT = 100_000.0
+# ---------------------------------------------------------------------------
+# Input file patterns
+# ---------------------------------------------------------------------------
+# Patterns are evaluated inside DATA_DIR unless an absolute path is provided.
+#
+# Files whose names contain any of the substrings in EXCLUDE_FILENAME_SUBSTRINGS
+# are ignored when "latest file" resolution is performed.
+EXCLUDE_FILENAME_SUBSTRINGS = ("sim",)
+
+INDEX_FILE_GLOBS = {
+    "SP500": "^spx_d_*.csv",
+    "NDX": "*ndx_d*.csv",
+}
+
+ACTUAL_ETF_FILE_GLOBS = {
+    "SPXL": "*spxl_d_*.csv",
+    "SSO": "*sso_d_*.csv",
+    "TQQQ": "*tqqq_d_*.csv",
+    "QLD": "*qld_d_*.csv",
+}
+
+RAW_DATA_FILES = {
+    "sp500_dividend_monthly": "raw/SPX Dividend Yield by Month_*.csv",
+    "tbill_1920_1934_monthly": "raw/Yields on Short-Term United States Securities*.csv",
+    "tb3ms_1934_now_monthly": "raw/*TB3MS*.csv",
+}
 
 # ---------------------------------------------------------------------------
 # Series resolution for the loader
@@ -108,6 +134,8 @@ SERIES_SPECS = {
     "SP500_TR": "^SPX_*_daily_TR.csv",  # S&P 500 Total Return (daily)
     "SSO_2x_TR": "^sso_simulated_d_TR_*%cost*.csv",  # 2x TR simulation (daily)
     "SPXL_3x_TR": "^spxl_simulated_d_TR_*%cost*.csv",  # 3x TR simulation (daily)
+    "TQQQ_3x_TR": "^tqqq_simulated_d_TR_*.csv",
+    "QLD_2x_TR": "^qld_simulated_d_TR_*.csv",
 }
 
 # ---------------------------------------------------------------------------
@@ -119,47 +147,210 @@ PORTFOLIOS = {
     "S&P500": {"SP500_TR": 1.0},
     "sim_SSO": {"SSO_2x_TR": 1.0},
     "sim_SPXL": {"SPXL_3x_TR": 1.0},
+    # "sim_TQQQ": {"TQQQ_3x_TR": 1.0},
+    # "sim_QLD": {"QLD_2x_TR": 1.0},
     #
-    "S&P500 25/75 SSO": {"SP500_TR": 0.25, "SSO_2x_TR": 0.75},
-    "S&P500 50/50 SSO": {"SP500_TR": 0.5,  "SSO_2x_TR": 0.5},
-    "S&P500 75/25 SSO": {"SP500_TR": 0.75, "SSO_2x_TR": 0.25},
-
-    "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
-    "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
-    "S&P500 75/25 SPXL": {"SP500_TR": 0.75, "SPXL_3x_TR": 0.25},
+    # "S&P500 25/75 SSO": {"SP500_TR": 0.25, "SSO_2x_TR": 0.75},
+    # "S&P500 50/50 SSO": {"SP500_TR": 0.5,  "SSO_2x_TR": 0.5},
+    # "S&P500 75/25 SSO": {"SP500_TR": 0.75, "SSO_2x_TR": 0.25},
+    #
+    # "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
+    # "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
+    # "S&P500 75/25 SPXL": {"SP500_TR": 0.75, "SPXL_3x_TR": 0.25},
     # "SPXL 50/Cash 50": {"SPXL_3x_TR": 0.50, "CASH": 0.50},  If you want cash in portoflio
 }
 
 # ---------------------------------------------------------------------------
-# Leveraged ETF simulation defaults (used by generate_leveraged_etf.py)
+# Leveraged ETF simulation defaults
 # ---------------------------------------------------------------------------
-SPXL_FIXED_COST = 0.01022  # Annual cost for SPXL (3x), e.g., 2.02%
-SSO_FIXED_COST = 0.01004  # Annual cost for SSO  (2x), e.g., 1.50%
+# Models:
+# - "dividend_carry":
+#       r_sim = L * r_index + [L * div_y - (L - 1) * borrow] * dt - fee * dt
+# - "constant_effective_carry":
+#       r_sim = L * r_index + [carry - (L - 1) * borrow] * dt - fee * dt
+#
+# The constant_effective_carry model is intended for TQQQ / QLD total-return
+# reconstruction when a long ^XNDX history or a long ^NDX dividend-yield history
+# is unavailable.
 
-BORROW_ALPHA = 1.073577
-BORROW_BETA = 0.4522 / 100
+COMMON_BORROW_ALPHA = 1.073577
+COMMON_BORROW_BETA = 0.4522 / 100
 
-# --- Symbol-specific (optional). If None, fall back to the common BORROW_ALPHA/BETA above. ---
-# 単位は共通設定と同じ（β は年率の加算項）
-SPXL_BORROW_ALPHA: float | None = 1.073577
-SPXL_BORROW_BETA: float | None = 0.4543 / 100
-SSO_BORROW_ALPHA: float | None = 1.044867
-SSO_BORROW_BETA: float | None = 0.4522 / 100
-
-
-# Include dividends (TR) vs Exclude dividends (price-only)
 INCLUDE_DIVIDENDS = True
+BASE_FROM_INDEX = True
 
-# If True, simulated price level is anchored at the input SPX starting price;
-# otherwise, simulation starts at 1.0
-BASE_FROM_SPX = True
+SIMULATION_SPECS = {
+    "SPXL": {
+        "model": "dividend_carry",
+        "underlying": "SP500",
+        "leverage": 3,
+        "cost_annual": 0.01022,
+        "borrow_alpha": 1.073577,
+        "borrow_beta": 0.4543 / 100,
+        "carry_annual": 0.0,
+        "output_prefix": "^spxl_simulated_d",
+    },
+    "SSO": {
+        "model": "dividend_carry",
+        "underlying": "SP500",
+        "leverage": 2,
+        "cost_annual": 0.01004,
+        "borrow_alpha": 1.044867,
+        "borrow_beta": 0.4522 / 100,
+        "carry_annual": 0.0,
+        "output_prefix": "^sso_simulated_d",
+    },
+    "TQQQ": {
+        "model": "constant_effective_carry",
+        "underlying": "NDX",
+        "leverage": 3,
+        "cost_annual": 0.0097,
+        "borrow_alpha": 1.345167,
+        "borrow_beta": 0.001,
+        "carry_annual": 0.02908374,
+        "output_prefix": "^tqqq_simulated_d",
+    },
+    "QLD": {
+        "model": "constant_effective_carry",
+        "underlying": "NDX",
+        "leverage": 2,
+        "cost_annual": 0.0098,
+        "borrow_alpha": 1.236665,
+        "borrow_beta": 0.001,
+        "carry_annual": 0.01579636,
+        "output_prefix": "^qld_simulated_d",
+    },
+}
+
+SIMULATION_DEFAULT_SYMBOLS = ["SPXL", "SSO", "TQQQ", "QLD"]
+
+# ---------------------------------------------------------------------------
+# Optimization defaults for leveraged ETF calibration
+# ---------------------------------------------------------------------------
+# Each symbol can define:
+# - actual_glob: pattern for the live ETF history inside DATA_DIR
+# - optimize_params: parameters to optimize
+# - bounds: lower/upper bounds for each parameter
+# - initial: initial guess for each parameter
+#
+# Supported optimizable parameters:
+# - "borrow_alpha"
+# - "borrow_beta"
+# - "cost_annual"
+# - "carry_annual"
+OPTIMIZATION_DEFAULT_SYMBOLS = ["SPXL", "SSO", "TQQQ", "QLD"]
+OPTIMIZATION_DEFAULT_LOSS = "mae"
+OPTIMIZATION_DEFAULT_HUBER_DELTA = 1.0
+OPTIMIZATION_DEFAULT_TRIM = 0.02
+OPTIMIZATION_MAX_OUTER = 12
+OPTIMIZATION_TOL = 1e-5
+OPTIMIZATION_SAVE_BEST_SIM = True
+
+OPTIMIZATION_SPECS = {
+    "SPXL": {
+        "actual_glob": ACTUAL_ETF_FILE_GLOBS["SPXL"],
+        "optimize_params": ["borrow_alpha", "borrow_beta", "cost_annual"],
+        "bounds": {
+            "borrow_alpha": (0.80, 1.50),
+            "borrow_beta": (0.0000, 0.0300),
+            "cost_annual": (0.0080, 0.0500),
+        },
+        "initial": {
+            "borrow_alpha": SIMULATION_SPECS["SPXL"]["borrow_alpha"],
+            "borrow_beta": SIMULATION_SPECS["SPXL"]["borrow_beta"],
+            "cost_annual": SIMULATION_SPECS["SPXL"]["cost_annual"],
+        },
+    },
+    "SSO": {
+        "actual_glob": ACTUAL_ETF_FILE_GLOBS["SSO"],
+        "optimize_params": ["borrow_alpha", "borrow_beta", "cost_annual"],
+        "bounds": {
+            "borrow_alpha": (0.80, 1.50),
+            "borrow_beta": (0.0000, 0.0300),
+            "cost_annual": (0.0080, 0.0500),
+        },
+        "initial": {
+            "borrow_alpha": SIMULATION_SPECS["SSO"]["borrow_alpha"],
+            "borrow_beta": SIMULATION_SPECS["SSO"]["borrow_beta"],
+            "cost_annual": SIMULATION_SPECS["SSO"]["cost_annual"],
+        },
+    },
+    "TQQQ": {
+        "actual_glob": ACTUAL_ETF_FILE_GLOBS["TQQQ"],
+        "optimize_params": ["borrow_alpha", "borrow_beta", "cost_annual", "carry_annual"],
+        "bounds": {
+            "borrow_alpha": (0.50, 1.75),
+            "borrow_beta": (0.0010, 0.0300),
+            "cost_annual": (0.0097, 0.0300),
+            "carry_annual": (-0.0200, 0.0500),
+        },
+        "initial": {
+            "borrow_alpha": max(1.00, SIMULATION_SPECS["TQQQ"]["borrow_alpha"]),
+            "borrow_beta": max(0.0010, SIMULATION_SPECS["TQQQ"]["borrow_beta"]),
+            "cost_annual": max(0.0097, SIMULATION_SPECS["TQQQ"]["cost_annual"]),
+            "carry_annual": SIMULATION_SPECS["TQQQ"]["carry_annual"],
+        },
+    },
+    "QLD": {
+        "actual_glob": ACTUAL_ETF_FILE_GLOBS["QLD"],
+        "optimize_params": ["borrow_alpha", "borrow_beta", "cost_annual", "carry_annual"],
+        "bounds": {
+            "borrow_alpha": (0.50, 1.75),
+            "borrow_beta": (0.0010, 0.0300),
+            "cost_annual": (0.0098, 0.0300),
+            "carry_annual": (-0.0200, 0.0500),
+        },
+        "initial": {
+            "borrow_alpha": max(1.00, SIMULATION_SPECS["QLD"]["borrow_alpha"]),
+            "borrow_beta": max(0.0010, SIMULATION_SPECS["QLD"]["borrow_beta"]),
+            "cost_annual": max(0.0098, SIMULATION_SPECS["QLD"]["cost_annual"]),
+            "carry_annual": SIMULATION_SPECS["QLD"]["carry_annual"],
+        },
+    },
+}
+# ---------------------------------------------------------------------------
+# Hard floors used during optimization
+# ---------------------------------------------------------------------------
+# These floors are applied in addition to the optimization bounds.
+# They prevent obviously unrealistic solutions such as:
+# - borrow_beta = 0.0
+# - cost_annual below the chosen ETF expense-ratio floor
+#
+# Note:
+# - TQQQ official gross expense ratio is 0.97%.
+# - QLD official gross expense ratio is currently 0.97% on the ProShares
+#   fact sheet, but if you want to enforce 0.98% as your research floor,
+#   keep 0.0098 below.
+OPTIMIZATION_HARD_FLOORS = {
+    "SPXL": {
+        "cost_annual": 0.0087,
+        "borrow_beta": 0.0001,
+    },
+    "SSO": {
+        "cost_annual": 0.0087,
+        "borrow_beta": 0.0001,
+    },
+    "TQQQ": {
+        "cost_annual": 0.0097,   # 0.97%
+        "borrow_beta": 0.0010,   # 0.10%/yr minimum positive spread
+    },
+    "QLD": {
+        "cost_annual": 0.0098,   # 0.98% floor requested by user
+        "borrow_beta": 0.0010,   # 0.10%/yr minimum positive spread
+    },
+}
 
 
-# DCA 拠出間隔（--style dca のとき有効）
+# ---------------------------------------------------------------------------
+# DCA settings
+# ---------------------------------------------------------------------------
 # 'every_period' | 'weekly' | 'monthly' | 'quarterly' | 'yearly'
 DCA_INTERVAL = "monthly"
 
-# CASH 擬似資産（ポートフォリオに 'CASH' を含む場合）
+# ---------------------------------------------------------------------------
+# CASH pseudo-asset settings
+# ---------------------------------------------------------------------------
+
 # 'flat'  : 常に0%（Price=1の等価）
 # 'fixed' : 年率固定（期毎に等分換算）
 # 'rf'    : リスクフリー（月次RFが data/raw に必要）
