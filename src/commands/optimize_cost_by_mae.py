@@ -51,6 +51,7 @@ from src.dividend_loader import (
     load_monthly_dividend_and_riskfree,
     to_daily_series_from_monthly,
 )
+from src.utils import read_price_csv_two_col
 
 
 # ---------------------------------------------------------------------------
@@ -63,63 +64,6 @@ class PreparedInputs:
     div_spx_d: pd.Series
     rf_spx_d: pd.Series
     rf_ndx_d: pd.Series
-
-
-def read_actual_etf_csv(path: Path) -> pd.DataFrame:
-    """
-    Read a live ETF CSV and normalize to Date / Price.
-
-    Preference order for price columns:
-    1) Adj Close
-    2) Close
-
-    This function is robust to mixed date formats such as:
-    - YYYY-MM-DD
-    - YYYY/M/D
-    """
-    df = pd.read_csv(path)
-
-    if "Date" not in df.columns:
-        raise ValueError(f"'Date' column not found in {path.name}")
-
-    price_col = None
-    for candidate in ("Adj Close", "Close"):
-        if candidate in df.columns:
-            price_col = candidate
-            break
-
-    if price_col is None:
-        lower_map = {c.lower(): c for c in df.columns}
-        for candidate in ("adj close", "close"):
-            if candidate in lower_map:
-                price_col = lower_map[candidate]
-                break
-
-    if price_col is None:
-        raise ValueError(f"Neither 'Adj Close' nor 'Close' was found in {path.name}")
-
-    try:
-        dt = pd.to_datetime(df["Date"], errors="coerce", utc=True, format="mixed")
-    except TypeError:
-        dt = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        if dt.isna().any():
-            dt2 = pd.to_datetime(
-                df["Date"].astype(str).str.replace("/", "-", regex=False),
-                errors="coerce",
-                utc=True,
-            )
-            dt = dt.fillna(dt2)
-
-    df["Date"] = dt.dt.tz_convert(None).dt.floor("D")
-    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
-
-    df = (
-        df.dropna(subset=["Date", price_col])
-        .sort_values("Date")
-        .reset_index(drop=True)
-    )
-
-    return df[["Date", price_col]].rename(columns={price_col: "Price"})
 
 
 def build_monthly_input_paths(
@@ -376,7 +320,7 @@ def get_actual_series_for_symbol(
         base_dir=settings.DATA_DIR,
         exclude_substrings=settings.EXCLUDE_FILENAME_SUBSTRINGS,
     )
-    df = read_actual_etf_csv(path)
+    df = read_price_csv_two_col(path)
 
     if start is not None:
         df = df[df["Date"] >= start]

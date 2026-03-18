@@ -35,6 +35,7 @@ from matplotlib import font_manager
 
 from src import settings
 from src.commands.generate_leveraged_etf import find_latest_file
+from src.utils import read_price_csv_two_col
 
 try:
     from src.visualizer import save_with_watermarks
@@ -199,66 +200,6 @@ def latest_actual_for_symbol(symbol: str) -> ActualMeta:
     )
     return parse_actual_filename_tag(path)
 
-
-# ---------------------------------------------------------------------------
-# CSV loading
-# ---------------------------------------------------------------------------
-def read_price_csv(path: Path) -> pd.DataFrame:
-    """
-    Read a CSV and normalize to Date / Price.
-
-    Preference order:
-    1) Adj Close
-    2) Price
-    3) Close
-
-    This function is robust to mixed date formats such as:
-    - YYYY-MM-DD
-    - YYYY/M/D
-    """
-    df = pd.read_csv(path)
-
-    if "Date" not in df.columns:
-        raise ValueError(f"'Date' column not found in {path.name}.")
-
-    price_col = None
-    for candidate in ("Adj Close", "Price", "Close"):
-        if candidate in df.columns:
-            price_col = candidate
-            break
-
-    if price_col is None:
-        lower_map = {c.lower(): c for c in df.columns}
-        for candidate in ("adj close", "price", "close"):
-            if candidate in lower_map:
-                price_col = lower_map[candidate]
-                break
-
-    if price_col is None:
-        raise ValueError(f"Price-like column not found in {path.name}.")
-
-    try:
-        dt = pd.to_datetime(df["Date"], errors="coerce", utc=True, format="mixed")
-    except TypeError:
-        dt = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        if dt.isna().any():
-            dt2 = pd.to_datetime(
-                df["Date"].astype(str).str.replace("/", "-", regex=False),
-                errors="coerce",
-                utc=True,
-            )
-            dt = dt.fillna(dt2)
-
-    df["Date"] = dt.dt.tz_convert(None).dt.floor("D")
-    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
-
-    df = (
-        df.dropna(subset=["Date", price_col])
-        .sort_values("Date")
-        .reset_index(drop=True)
-    )
-
-    return df[["Date", price_col]].rename(columns={price_col: "Price"})
 
 # ---------------------------------------------------------------------------
 # Comparison core
@@ -430,8 +371,8 @@ def run_for_symbol(
     df_sim = read_price_csv(simulated_meta.path)
 
     if end is not None:
-        df_actual = df_actual[df_actual["Date"] <= end].reset_index(drop=True)
-        df_sim = df_sim[df_sim["Date"] <= end].reset_index(drop=True)
+        df_actual = read_price_csv_two_col(actual_meta.path)
+        df_sim = read_price_csv_two_col(simulated_meta.path)
 
     start_eff = start
     if start_eff is None:

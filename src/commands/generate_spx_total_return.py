@@ -75,6 +75,8 @@ import platform
 import pandas as pd
 import re
 
+from src.utils import read_price_csv_two_col
+
 
 def _contains_wildcard(s: str) -> bool:
     """
@@ -183,62 +185,6 @@ def _normalize_dates_for_spx(s: pd.Series) -> pd.Series:
     s = s.str.translate(trans)
     dt = pd.to_datetime(s, errors='coerce', utc=True)
     return dt.dt.tz_convert(None).dt.floor('D')
-
-
-def _read_spx_daily(spx_csv: Path) -> pd.DataFrame:
-    """
-    Read and standardize a daily S&P 500 price series from CSV.
-
-    The loader accepts several common layouts:
-      - Exactly two columns with header where first is 'Date' (second renamed to 'Price').
-      - Two-column raw file without header (interpreted as 'Date', 'Price').
-      - Files where the price column is named one of {'Close', 'Adj Close', 'Last', 'PX_LAST'}.
-
-    The function:
-      * trims/normalizes dates,
-      * coerces price to numeric,
-      * drops rows with missing Date or Price,
-      * sorts by Date, and
-      * returns only ['Date', 'Price'].
-
-    Parameters
-    ----------
-    spx_csv : pathlib.Path
-        Path to the SPX daily CSV.
-
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame with columns ['Date', 'Price'] sorted ascending by Date.
-
-    Notes
-    -----
-    A brief range summary is printed if the dataframe is not empty.
-    """
-    df = pd.read_csv(spx_csv)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    if len(df.columns) == 2 and df.columns[0].lower() == 'date':
-        second = df.columns[1]
-        df = df.rename(columns={second: 'Price'})
-    else:
-        # Try no-header case
-        df = pd.read_csv(spx_csv, header=None, names=['Date', 'Price'])
-
-    if 'Date' not in df.columns or 'Price' not in df.columns:
-        for cand in [c for c in df.columns if str(c).lower() in ('close', 'adj close', 'last', 'px_last')]:
-            df = df.rename(columns={cand: 'Price'})
-            break
-
-    df = df[['Date', 'Price']]
-    df = df[df['Date'].astype(str).str.match(r'^\s*\d')]
-    df['Date'] = _normalize_dates_for_spx(df['Date'])
-    df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
-    df = df.dropna(subset=['Date', 'Price']).sort_values('Date').reset_index(drop=True)
-
-    if not df.empty:
-        print(f"[info] SPX range: {df['Date'].min().date()} -> {df['Date'].max().date()} rows={len(df)}")
-    return df[['Date', 'Price']]
 
 
 _MONTH_3 = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -477,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     spx_path = resolve_latest(args.spx)
     div_path = resolve_latest(args.dividend)
 
-    spx = _read_spx_daily(spx_path)
+    spx = read_price_csv_two_col(path, assume_header=None, verbose=True)
     if args.start:
         spx = spx[spx['Date'] >= pd.to_datetime(args.start)]
     if args.end:

@@ -54,6 +54,7 @@ from src.dividend_loader import (
     load_monthly_dividend_and_riskfree,
     to_daily_series_from_monthly,
 )
+from src.utils import read_price_csv_two_col
 
 
 def find_latest_file(
@@ -128,84 +129,13 @@ def find_latest_file(
 
 
 def read_index_daily(index_csv: Path) -> pd.DataFrame:
- """
- Load and normalize a daily index CSV.
+    """
+    Load a daily index CSV as a strict two-column (Date, Price) file.
+    This wrapper delegates to the unified reader in src.utils.
+    """
+    df = read_price_csv_two_col(index_csv)
+    return df[["Date", "Price"]]
 
- This reader is robust to mixed date formats such as:
- - 1885-02-17
- - 1900/1/2
-
- Parameters
- ----------
- index_csv
-     Path to the CSV file containing daily index observations.
-
- Returns
- -------
- pandas.DataFrame
-     Cleaned DataFrame with columns:
-     - Date
-     - Price
- """
- df = pd.read_csv(index_csv)
-
- if "Date" not in df.columns and df.shape[1] == 2:
-  df = df.rename(columns={df.columns[0]: "Date", df.columns[1]: "Price"})
-
- if "Date" not in df.columns:
-  raise ValueError(f"'Date' column not found in {index_csv.name}.")
-
- price_col = None
- for candidate in ("Price", "Adj Close", "Close"):
-  if candidate in df.columns:
-   price_col = candidate
-   break
-
- if price_col is None:
-  lower_map = {c.lower(): c for c in df.columns}
-  for candidate in ("price", "adj close", "close"):
-   if candidate in lower_map:
-    price_col = lower_map[candidate]
-    break
-
- if price_col is None:
-  raise ValueError(f"Could not detect a price column in {index_csv.name}.")
-
- # Keep only rows that begin with a digit-like date string
- df = df[df["Date"].astype(str).str.match(r"^\s*\d")].copy()
-
- # Robust mixed-format parsing:
- # - pandas >= 2.0 supports format="mixed"
- # - fallback: normalize '/' to '-' and parse again
- try:
-  dt = pd.to_datetime(df["Date"], errors="coerce", format="mixed")
- except TypeError:
-  dt = pd.to_datetime(df["Date"], errors="coerce")
-  if dt.isna().any():
-   dt2 = pd.to_datetime(
-    df["Date"].astype(str).str.replace("/", "-", regex=False),
-    errors="coerce",
-   )
-   dt = dt.fillna(dt2)
-
- df["Date"] = dt
- df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
-
- bad_dates = int(df["Date"].isna().sum())
- bad_prices = int(df[price_col].isna().sum())
- if bad_dates > 0 or bad_prices > 0:
-  print(
-   f"[warn] {index_csv.name}: dropping {bad_dates} rows with invalid dates "
-   f"and {bad_prices} rows with invalid prices."
-  )
-
- df = (
-  df.dropna(subset=["Date", price_col])
-  .sort_values("Date")
-  .reset_index(drop=True)
- )
-
- return df[["Date", price_col]].rename(columns={price_col: "Price"})
 
 def annual_to_step_additive(rate_annual: pd.Series | float, dt_years: pd.Series) -> pd.Series:
     """
