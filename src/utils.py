@@ -1,9 +1,7 @@
 # src/utils.py
-# src/utils.py
 from __future__ import annotations
-
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, List
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -50,12 +48,6 @@ def _normalize_dates_robust(s: pd.Series) -> pd.Series:
     # Convert to naive and floor to day (00:00).
     return dt.dt.tz_convert(None).dt.floor("D")
 
-
-# src/utils.py
-from __future__ import annotations
-from pathlib import Path
-from typing import Optional, Union, List
-import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Robust date normalization

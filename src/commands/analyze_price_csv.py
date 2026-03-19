@@ -1,5 +1,6 @@
 # src/commands/analyze_price_csv.py
 from __future__ import annotations
+
 """
 Analyze a two-column CSV (left: Date, right: Price), produce:
 - Price line chart (PNG, linear)
@@ -24,6 +25,7 @@ from rich.table import Table
 
 # ---- Unified reader (moved to utils) ----
 from src.utils import read_price_csv_two_col
+from src import settings
 
 # ---------- Data IO ----------
 def filter_by_date(df_price: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
@@ -252,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Analyze a (Date, Price) CSV: price plot (linear & log), return histograms, and summary metrics."
     )
     ap.add_argument("--csv", required=True, help="Path to CSV (left=Date, right=Price).")
-    ap.add_argument("--outdir", default="outputs/csv_stats", help="Directory to save charts and tables.")
+    ap.add_argument("--outdir", default=str(Path(settings.OUTPUT_DIR) / "analyze"), help="Directory to save charts and tables.")
     ap.add_argument("--title", default="", help="Chart title prefix.")
     ap.add_argument("--bins", type=int, default=50, help="Histogram bins.")
     ap.add_argument("--dpi", type=int, default=150, help="Figure DPI.")
