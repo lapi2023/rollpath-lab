@@ -5,7 +5,8 @@ import os
 import re
 import time
 import unicodedata
-from typing import Dict
+import hashlib
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,134 @@ def _safe_datestr(x):
 def _from_settings(name: str, default):
     return getattr(settings, name, default)
 
+# -----------------------------------------------------------------------------
+# Output subfolder name shortening (path-length guard)
+# -----------------------------------------------------------------------------
+_MAX_SAFE_FULLPATH = 200  # leave headroom for filenames created under the folder
+
+def _unit_abbrev(unit: str) -> str:
+    u = (unit or "").lower()
+    return {"years": "y", "months": "mo", "days": "d"}.get(u, u)
+
+def _freq_abbrev(freq: str) -> str:
+    f = (freq or "").lower()
+    return {"daily": "d", "monthly": "m", "yearly": "y"}.get(f, f)
+
+def _reb_abbrev(reb: str) -> str:
+    r = (reb or "").lower()
+    if r == "none": return "reb-none"
+    if r == "every_period": return "reb-every"
+    if r == "monthly": return "reb-m"
+    if r == "yearly": return "reb-y"
+    m = re.match(r"yearly_(\d+)", r)
+    if m: return f"reb-y{m.group(1)}"
+    return f"reb-{_safe_str(r)}"
+
+def _collect_asset_tokens(portfolio_names: List[str]) -> List[str]:
+    """
+    Extract compact asset tokens seen across portfolio names.
+    Examples:
+      'S&P500 25/75 SPXL' -> tokens {'SP500','SPXL'}
+      'SSO 50/50 SPXL'    -> tokens {'SSO','SPXL'}
+    """
+    toks = set()
+    for name in portfolio_names:
+        u = name.upper()
+        if ("S&P500" in u) or ("S&P 500" in u) or ("SP500" in u):
+            toks.add("SP500")
+        if "SPXL" in u: toks.add("SPXL")
+        if "SSO"  in u: toks.add("SSO")
+        if "TQQQ" in u: toks.add("TQQQ")
+        if "QLD"  in u: toks.add("QLD")
+        if "CASH" in u: toks.add("CASH")
+    if not toks:
+        # Fallback: first tokens of each name (sanitized), limited count
+        base = [re.split(r"[_\s]", _safe_str(n))[0] for n in portfolio_names]
+        toks = set(base[:5])
+    return sorted(toks)
+
+def _summarized_group_slug(portfolio_names: List[str]) -> str:
+    # NOTE: hash suffix is not added here; it's added in _shorten_subfolder_if_needed()
+    toks = _collect_asset_tokens(portfolio_names)
+    return "_".join(toks) + "_portfolios"
+
+def _compact_int(n: int) -> str:
+    """
+    Compact integer formatter for tags: 1500 -> '1.5k', 1000 -> '1k', 1_000_000 -> '1m'
+    Uses lower-case k/m/b/t. At most one decimal; trims trailing '.0'.
+    """
+    x = int(n)
+    sign = "-" if x < 0 else ""
+    ax = abs(x)
+    def _fmt(v: float, suffix: str) -> str:
+        s = f"{v:.1f}".rstrip("0").rstrip(".")
+        return f"{sign}{s}{suffix}"
+    if ax >= 1_000_000_000_000:
+        return _fmt(ax / 1_000_000_000_000, "t")
+    if ax >= 1_000_000_000:
+        return _fmt(ax / 1_000_000_000, "b")
+    if ax >= 1_000_000:
+        return _fmt(ax / 1_000_000, "m")
+    if ax >= 1_000:
+        return _fmt(ax / 1_000, "k")
+    return f"{x}"
+
+def _shorten_subfolder_if_needed(base_dir: os.PathLike, sub: str, portfolio_names: List[str], console) -> str:
+    """
+    If the full path is too long, replace the leading 'group' part by a summarized slug,
+    and also use compact tags for other fields. If still long, append an 8-char hash suffix.
+    Additionally, when summarized (…_portfolios), always append a 2-char hash derived
+    from the original group to preserve identity hints.
+    """
+    base = os.fspath(base_dir)
+    full = os.path.join(base, sub)
+    if len(full) <= _MAX_SAFE_FULLPATH:
+        return sub
+
+    # Split the original 'sub' to identify the group and tail parts.
+    # Original format: "{group}__{dates}_{horizon}_{freq}_{reb}_{tax}_{style}[...]"
+    parts = sub.split("__", 1)
+    group_orig = parts[0] if parts else sub
+    tail = parts[1] if len(parts) == 2 else ""
+
+    # Summarized group + 2-char hash from original group
+    group_sum_base = _summarized_group_slug(portfolio_names)  # e.g., SP500_SPXL_SSO_portfolios
+    h2 = hashlib.sha1(group_orig.encode("utf-8", errors="ignore")).hexdigest()[:2]
+    group_sum = f"{group_sum_base}_p{h2}"  # ← always add 2-char hash when summarized
+
+    # Compactify well-known tail tags (best-effort, idempotent)
+    tail2 = tail
+    tail2 = tail2.replace("rebalance", "reb")
+    tail2 = tail2.replace("reb-", "reb-")
+    tail2 = tail2.replace("tax-rate_", "t")
+    tail2 = tail2.replace("_years_", "_y_").replace("_months_", "_mo_").replace("_days_", "_d_")
+    tail2 = tail2.replace("_daily_", "_d_").replace("_monthly_", "_m_").replace("_yearly_", "_y_")
+    tail2 = tail2.replace("init_", "i").replace("amount_", "a")
+
+    sub2 = f"{group_sum}__{tail2}" if tail2 else group_sum
+    full2 = os.path.join(base, sub2)
+    if len(full2) <= _MAX_SAFE_FULLPATH:
+        console.print(f"[yellow]Output path too long ({len(full)} chars) → using summarized group: '{group_sum}'[/]")
+        return sub2
+
+    # Fallback: add an 8-char hash built from original group (in addition to 2-char hash)
+    h8 = hashlib.sha1(group_orig.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    group_sum_h = f"{group_sum}_g{h8}"
+    sub3 = f"{group_sum_h}__{tail2}" if tail2 else group_sum_h
+    full3 = os.path.join(base, sub3)
+    if len(full3) <= _MAX_SAFE_FULLPATH:
+        console.print(f"[yellow]Output path too long ({len(full)} chars) → summarized + hash: '{group_sum_h}'[/]")
+        return sub3
+
+    # Last resort: trim from the left of the tail to fit
+    over = len(full3) - _MAX_SAFE_FULLPATH
+    if over > 0 and tail2:
+        trimmed_tail = tail2[over:]
+        sub4 = f"{group_sum_h}__{trimmed_tail}"
+        console.print(f"[yellow]Output path still long → trimming middle section (kept rightmost {len(trimmed_tail)} chars).[/]")
+        return sub4
+
+    return sub3
 
 # Windows 'spawn' safe worker: compute metrics for one window
 
@@ -402,20 +531,28 @@ def run_analysis(args) -> None:
             roll_tax_sums = None
 
         if render_plots:
-            # Per-window output subfolder
+            # Per-window output subfolder (with path-length guard / summarization)
             group = "_".join([_safe_str(p) for p in portfolio_names])
+
+            unit_tag = f"{val}{_unit_abbrev(str(args.unit))}"
+            freq_tag = _freq_abbrev(str(args.freq))
+            reb_tag = _reb_abbrev(str(args.rebalance))
+            tax_tag = f"t{float(args.tax_rate):.1f}"
+
             sub = (
                 f"{group}__{_safe_datestr(actual_start)}_to_{_safe_datestr(actual_end)}_"
-                f"{val}{str(args.unit)}_{str(args.freq)}_reb-{str(args.rebalance)}_"
-                f"tax-rate_{float(args.tax_rate):.1f}_{str(args.style)}"
+                f"{unit_tag}_{freq_tag}_{reb_tag}_{tax_tag}_{str(args.style)}"
             )
             if str(args.style).lower() == "dca":
-                sub += f"_init_{int(args.initial)}_amount_{int(args.amount)}"
+                i_tag = _compact_int(int(args.initial))
+                a_tag = _compact_int(int(args.amount))
+                sub += f"_i{i_tag}_a{a_tag}"
+
+            # If too long for the filesystem, summarize the group name (adds 2-char hash).
+            sub = _shorten_subfolder_if_needed(settings.OUTPUT_DIR, sub, portfolio_names, console)
             output_dir_win = settings.OUTPUT_DIR / sub
             output_dir_win.mkdir(parents=True, exist_ok=True)
-            console.print(
-                f"saving charts and tables to: {str(output_dir_win.resolve())}"
-            )
+            console.print(f"saving charts and tables to: {str(output_dir_win.resolve())}")
 
             save_charts_and_tables(
                 output_dir_win,
