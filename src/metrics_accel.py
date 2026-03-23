@@ -29,6 +29,38 @@ def calculate_rolling_metrics(
     batch_size: int = 256,
     engine: str = 'numpy',
 ) -> Dict[str, np.ndarray]:
+    import numpy as _np
+
+    def _max_dd_with_idx_1d(y: _np.ndarray):
+        peak = float(y[0]);
+        peak_i = 0
+        best = 0.0;
+        i0 = i1 = 0
+        for k in range(1, y.size):
+            x = float(y[k])
+            if x > peak:
+                peak = x;
+                peak_i = k
+            dd = (x / max(peak, 1e-12)) - 1.0
+            if dd < best:
+                best = dd;
+                i0 = peak_i;
+                i1 = k
+        return best, i0, i1
+
+    def _max_du_1d(y: _np.ndarray):
+        trough = float(y[0]);
+        best = 0.0
+        for k in range(1, y.size):
+            x = float(y[k])
+            if x < trough:
+                trough = x
+            up = (x / max(trough, 1e-12)) - 1.0
+            if up > best:
+                best = up
+        return best
+
+
     xp, swv = _xp(engine)
     r = xp.asarray(returns, dtype=xp.float32).reshape(-1)
     N = int(r.shape[0])
@@ -68,6 +100,24 @@ def calculate_rolling_metrics(
     path_min = xp.empty((nW,), dtype=xp.float32)
     path_max = xp.empty((nW,), dtype=xp.float32)
     max_up   = xp.empty((nW,), dtype=xp.float32)
+
+    # Allocate output container
+    max_up_nonoverlap = _np.zeros((nW,), dtype=_np.float32)
+    B2 = int(max(1, batch_size))
+    for i in range(0, nW, B2):
+        j = min(i + B2, nW)
+        v = Pn[i:j, :]  # xp array
+        # bring to CPU as numpy for per-row loop (works for both numpy/cupy engine)
+        v_np = v.get().astype(_np.float64, copy=False) if (_HAS_CUPY and hasattr(v, 'get')) else _np.asarray(v,
+                                                                                                             dtype=_np.float64)
+
+        for r in range(v_np.shape[0]):
+            y = v_np[r, :]
+            _, i0, i1 = _max_dd_with_idx_1d(y)
+            upL = _max_du_1d(y[:max(0, i0)]) if i0 > 0 else 0.0
+            upR = _max_du_1d(y[min(y.size, i1 + 1):]) if (i1 + 1) < y.size else 0.0
+            max_up_nonoverlap[i + r] = float(upR if upR >= upL else upL)
+
     max_dd   = xp.empty((nW,), dtype=xp.float32)
     for i in range(0, nW, B):
         j = min(i + B, nW)
@@ -131,7 +181,7 @@ def calculate_rolling_metrics(
         'sharpe': to_np(sharpe),
         'path_min': to_np(path_min),
         'path_max': to_np(path_max),
-        'max_drawup': to_np(max_up),
+        'max_drawup': _np.asarray(max_up_nonoverlap, dtype=_np.float32),
         'max_drawdown': to_np(max_dd),
         'Final_Value': to_np(final_value),
         'CAGR_Simple': to_np(cagr_simple),

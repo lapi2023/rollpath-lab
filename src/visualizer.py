@@ -1,9 +1,8 @@
-# visualizer.py — v18 (English-only; dynamic year ticks; stacked bars for DCA representative paths + CSV exports)
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -16,8 +15,153 @@ from matplotlib import font_manager, rcParams
 from rich.console import Console
 from rich.table import Table
 
+# --- Add/Replace inside _smart_label_anchor ---
+import matplotlib.dates as _mdates
+
+def _smart_label_anchor(ax, x_data, y_data, *,
+                        final_xy=None,
+                        prefer="right-up",
+                        dx=8, dy=10):
+    """
+    Decide (xytext, ha, va) so that the text stays inside axes and avoids
+    the final value label when it is too close.
+    """
+    x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+
+    # Convert x_data (and final x) to axis numeric units (date -> float days)
+    def _x_to_num(x):
+        try:
+            return _mdates.date2num(x)
+        except Exception:
+            try:
+                return float(x)
+            except Exception:
+                return x0 + 0.5*(x1 - x0)
+
+    x_data_num = _x_to_num(x_data)
+    fx_num = _x_to_num(final_xy[0]) if final_xy is not None else None
+
+    xr = 0.5 if x1 == x0 else (x_data_num - x0) / (x1 - x0)
+    yr = 0.5 if y1 == y0 else (y_data - y0) / (y1 - y0)
+
+    # Base direction from preference
+    base_dx = dx if "right" in prefer else -dx
+    base_dy = dy if "up"    in prefer else -dy
+    ha = "left"  if base_dx > 0 else "right"
+    va = "bottom" if base_dy > 0 else "top"
+
+    # Keep inside: flip near edges
+    if xr > 0.88 and base_dx > 0:  # right edge
+        base_dx = -dx; ha = "right"
+    if xr < 0.12 and base_dx < 0:  # left edge
+        base_dx = dx;  ha = "left"
+    if yr > 0.90 and base_dy > 0:  # top edge
+        base_dy = -dy; va = "top"
+    if yr < 0.10 and base_dy < 0:  # bottom edge
+        base_dy = dy;  va = "bottom"
+
+    # Avoid collision with the final value tag (if provided)
+    if final_xy is not None and fx_num is not None:
+        near_x = abs(x_data_num - fx_num) < 6.0  # ~ 6 days
+        near_y = abs(y_data - final_xy[1]) / max((y1 - y0), 1e-6) < 0.10
+        if near_x and near_y:
+            base_dy = -base_dy
+            va = "top" if va == "bottom" else "bottom"
+            if xr > 0.92 and base_dx > 0:
+                base_dx = -dx; ha = "right"
+
+    return (base_dx, base_dy), ha, va
+
+def _max_drawdown_with_idx(y: np.ndarray) -> Tuple[float, int, int]:
+    """
+    Returns (max_dd, start_idx, end_idx) where max_dd <= 0 (e.g., -0.57).
+    """
+    if y.size == 0:
+        return 0.0, 0, 0
+    peak = y[0]
+    peak_i = 0
+    max_dd = 0.0
+    dd_i0 = dd_i1 = 0
+    for i in range(1, len(y)):
+        if y[i] > peak:
+            peak = y[i]
+            peak_i = i
+        dd = (y[i] / peak) - 1.0
+        if dd < max_dd:
+            max_dd = dd
+            dd_i0, dd_i1 = peak_i, i
+    return float(max_dd), int(dd_i0), int(dd_i1)
+
+def _max_drawup_with_idx(y: np.ndarray) -> Tuple[float, int, int]:
+    """
+    Returns (max_up, start_idx, end_idx) where max_up >= 0 (e.g., +0.83).
+    """
+    if y.size == 0:
+        return 0.0, 0, 0
+    trough = y[0]
+    trough_i = 0
+    max_up = 0.0
+    up_i0 = up_i1 = 0
+    for i in range(1, len(y)):
+        if y[i] < trough:
+            trough = y[i]
+            trough_i = i
+        up = (y[i] / trough) - 1.0
+        if up > max_up:
+            max_up = up
+            up_i0, up_i1 = trough_i, i
+    return float(max_up), int(up_i0), int(up_i1)
+
+# --- compute max drawup that does NOT overlap a locked segment (e.g., Max Drawdown) ---
+def _max_drawup_non_overlapping(y: np.ndarray, lock_range: Optional[Tuple[int, int]] = None) -> Tuple[float, int, int]:
+    """
+    Return the max drawup (>= 0) on y that does NOT overlap a locked segment.
+    Backward-compatible:
+      - If lock_range is None, behave exactly like _max_drawup_with_idx(y).
+    """
+    if lock_range is None:
+        return _max_drawup_with_idx(y)
+
+    n = int(len(y))
+    if n == 0:
+        return 0.0, 0, 0
+
+    i0, i1 = int(lock_range[0]), int(lock_range[1])
+    i0 = max(0, min(i0, n - 1))
+    i1 = max(0, min(i1, n - 1))
+    if i1 < i0:
+        i0, i1 = i1, i0
+
+    # strictly non-overlapping sides
+    L_lo, L_hi = 0, i0 - 1
+    R_lo, R_hi = i1 + 1, n - 1
+
+    def _range_drawup(lo: int, hi: int):
+        if hi - lo < 1:
+            return 0.0, lo, lo
+        v, s, e = _max_drawup_with_idx(y[lo:hi + 1])
+        return float(v), lo + int(s), lo + int(e)
+
+    # left / right segments
+    upL, sL, eL = (0.0, L_lo, L_lo) if L_hi < L_lo else _range_drawup(L_lo, L_hi)
+    upR, sR, eR = (0.0, R_hi, R_hi) if R_hi < R_lo else _range_drawup(R_lo, R_hi)
+
+    if upR > upL:
+        return upR, sR, eR
+    if upL > 0.0:
+        return upL, sL, eL
+
+    # Fallback: zero-length anchor next to the locked region
+    anchor = i0 - 1 if i0 - 1 >= 0 else (i1 + 1 if i1 + 1 < n else i0)
+    return 0.0, anchor, anchor
+def _days_between(dts: pd.Series, i0: int, i1: int) -> int:
+    try:
+        d0, d1 = pd.to_datetime(dts.iloc[i0]), pd.to_datetime(dts.iloc[i1])
+        return int((d1 - d0).days)
+    except Exception:
+        return max(0, i1 - i0)
+
 # unified foot-lines helper (place footnote outside the axes, bottom-right) ---
-# --- REPLACE _add_foot_lines with this version ---
 def _add_foot_lines(fig, text: str, *, max_fontsize: int = 6, bottom_pad: float | None = None, ha: str = "right") -> None:
     """
     Place explanatory foot lines at the bottom-right *outside* of the matrix/table axes,
@@ -46,6 +190,7 @@ def _add_foot_lines(fig, text: str, *, max_fontsize: int = 6, bottom_pad: float 
         ha=ha, va="bottom",
         fontsize=int(max_fontsize), color="#555555"
     )
+
 # =============================================================================
 # Font (force a CJK-capable family to avoid missing glyphs)
 # =============================================================================
@@ -1184,7 +1329,13 @@ def save_charts_and_tables(
                 "(contributions at period start; none at last step).",
                 "  - Tot CAGR (Simple, Med): Principal-based annualized rate with total contributed principal (I0 + A × #contrib).",
                 "  - IRR (Med): Money-weighted return solved from the median Final Value and the DCA cash-flow schedule.",
-                "  - Risk/Sharpe/Max Drawup/Max DD: Computed on price-path basis; drawup/down from normalized paths.",
+                "  - Risk/Sharpe: Computed on price-path basis; drawup/down from normalized paths.",
+                "  - Max DD(Drawdown): Max cumulative fall from rolling normalized path.",
+                "  - Max Drawup:Computed on segments that do NOT overlap the Max Drawdown interval "
+                "within the SAME rolling window. The Max Drawdown interval is locked FIRST (priority), "
+                "then Max Drawup is searched only on the LEFT or RIGHT side of that interval; ties "
+                "prefer the RIGHT side. "
+                "This policy ensures Max Drawup starts/ends either BEFORE or AFTER the Max Drawdown.",
                 "Assumptions: data freq sets ppy; DCA schedule follows '--dca-interval'; last period has no new contribution.",
             ]
         else:
@@ -1194,7 +1345,12 @@ def save_charts_and_tables(
                 "• Middle — Medians across windows:",
                 "  - Path Min/Max (Med): Median of within-window normalized path extrema (start=1).",
                 "  - CAGR/Risk/Sharpe: Standard annualization with ppy set by '--freq'.",
-                "  - Max Drawup/Max DD: Max cumulative rise/fall from rolling normalized path.",
+                "  - Max DD(Drawdown): Max cumulative fall from rolling normalized path.",
+                "  - Max Drawup:Computed on segments that do NOT overlap the Max Drawdown interval "
+                "within the SAME rolling window. The Max Drawdown interval is locked FIRST (priority), \n"
+                "then Max Drawup is searched only on the LEFT or RIGHT side of that interval; "
+                "ties prefer the RIGHT side.\n"
+                "This policy ensures Max Drawup starts/ends either BEFORE or AFTER the Max Drawdown."
             ]
         notes_text = "\n".join(notes_lines)
         n_note_lines = notes_text.count("\n") + 1
@@ -1407,26 +1563,43 @@ def save_charts_and_tables(
                 mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
                 ax2 = ax.twinx()
                 bar_x = np.arange(1, L + 1, dtype=int)[mask]
+                # Make contribution bars bolder and in front of the grid/lines just enough.
                 ax2.bar(
                     bar_x,
                     np.full(bar_x.shape, float(amount)),
-                    width=0.75,
-                    color="gray",
-                    alpha=0.22,
-                    edgecolor="none",
+                    width=3.0,  # thicker bars (was 1.8)
+                    color="#5f5f5f",  # darker neutral
+                    alpha=0.55,  # more opaque (was 0.22)
+                    edgecolor="#3d3d3d",  # subtle outline
+                    linewidth=0.35,
                     label="Contribution (schedule)",
-                    zorder=1,
+                    zorder=3,  # lift above most lines; still below annotations
                 )
+
                 ax2.set_ylabel("Contribution per period")
 
             for p in portfolio_names:
                 if p in tv_mean:
+                    # y is the typical normalized price path Pn (start=1)
                     y = np.asarray(tv_mean[p], dtype=float)
-                    ax.plot(step_arr, y, label=f"{p} Mean", linewidth=1.9, zorder=5)
-                    # final value label
+
+                    # --- DCA only: convert Pn -> VALUE (currency) ---
+                    if is_dca:
+                        # Contribution schedule (start-of-period, no last-step contrib)
+                        mask_bool = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
+                        inv_pn = 1.0 / np.clip(y, 1e-12, None)
+                        shares = float(initial_cap or 0.0) + float(amount or 0.0) * np.cumsum(
+                            inv_pn * mask_bool.astype(float))
+                        y_plot = y * shares  # VALUE in currency units
+                    else:
+                        y_plot = y  # Lump sum: keep as-is (currency if initial_cap>0 else index-like)
+
+                    ax.plot(step_arr, y_plot, label=f"{p} Mean", linewidth=1.9, zorder=5)
+
+                    # final value label (currency-friendly)
                     ax.annotate(
-                        f"{y[-1]:,.0f}",
-                        xy=(step_arr[-1], y[-1]),
+                        f"{y_plot[-1]:,.0f}",
+                        xy=(step_arr[-1], y_plot[-1]),
                         xytext=(5, 0),
                         textcoords="offset points",
                         va="center",
@@ -1434,22 +1607,25 @@ def save_charts_and_tables(
                         color="#333",
                     )
 
-            ax.set_ylabel("Portfolio value (linear)")
-            ax.set_title(f"Rolling Typical VALUE Path — Mean only\n{caption}")
-            ax.grid(True, linewidth=0.3, alpha=0.5)
-            y_ticks, _ = _year_ticks(L, ppy)
-            ax.set_xticks(y_ticks)
-            ax.set_xticklabels([f"Y{i}" for i in range(1, len(y_ticks) + 1)])
+            # Left axis → portfolio amount; format as K/M/B/T
+            ax.set_ylabel("Portfolio amount")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+
+            # Right axis (contribution) → also format
+            if is_dca and amount and amount > 0:
+                ax2.set_ylabel("Contribution per period")
+                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+
+            # Legend merge unchanged
             if is_dca and amount and amount > 0:
                 lines, labels = ax.get_legend_handles_labels()
                 lines2, labels2 = ax2.get_legend_handles_labels()
                 ax.legend(lines + lines2, labels + labels2, loc="best")
             else:
                 ax.legend(loc="best")
+
             plt.tight_layout()
-            save_with_watermarks(
-                output_dir / "typical_value_mean_all_ports.png", dpi=150
-            )
+            save_with_watermarks(output_dir / "typical_value_mean_all_ports.png", dpi=150)
 
             # ---------- Median (linear) + final labels ----------
             plt.figure(figsize=(12, 6))
@@ -1458,74 +1634,72 @@ def save_charts_and_tables(
                 mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
                 ax2 = ax.twinx()
                 bar_x = np.arange(1, L + 1, dtype=int)[mask]
+                # Make contribution bars bolder and in front of the grid/lines just enough.
                 ax2.bar(
                     bar_x,
                     np.full(bar_x.shape, float(amount)),
-                    width=0.75,
-                    color="gray",
-                    alpha=0.22,
-                    edgecolor="none",
+                    width=3.0,  # thicker bars (was 1.8)
+                    color="#5f5f5f",  # darker neutral
+                    alpha=0.55,  # more opaque (was 0.22)
+                    edgecolor="#3d3d3d",  # subtle outline
+                    linewidth=0.35,
                     label="Contribution (schedule)",
-                    zorder=1,
+                    zorder=3,  # lift above most lines; still below annotations
                 )
+
                 ax2.set_ylabel("Contribution per period")
 
             for p in portfolio_names:
+                src = None
                 if p in tv_median:
-                    y = np.asarray(tv_median[p], dtype=float)
-                    ax.plot(
-                        step_arr,
-                        y,
-                        label=f"{p} Median",
-                        linewidth=1.9,
-                        linestyle="--",
-                        zorder=5,
-                    )
-                    ax.annotate(
-                        f"{y[-1]:,.0f}",
-                        xy=(step_arr[-1], y[-1]),
-                        xytext=(5, 0),
-                        textcoords="offset points",
-                        va="center",
-                        fontsize=9,
-                        color="#333",
-                    )
+                    src = np.asarray(tv_median[p], dtype=float)
+                    series_label = f"{p} Median"
                 elif p in tv_mean:
-                    y = np.asarray(tv_mean[p], dtype=float)
-                    ax.plot(
-                        step_arr,
-                        y,
-                        label=f"{p} Median(n/a→Mean)",
-                        linewidth=1.9,
-                        linestyle="--",
-                        zorder=5,
-                    )
-                    ax.annotate(
-                        f"{y[-1]:,.0f}",
-                        xy=(step_arr[-1], y[-1]),
-                        xytext=(5, 0),
-                        textcoords="offset points",
-                        va="center",
-                        fontsize=9,
-                        color="#333",
-                    )
+                    src = np.asarray(tv_mean[p], dtype=float)
+                    series_label = f"{p} Median(n/a→Mean)"
+                else:
+                    continue
 
-            ax.set_ylabel("Portfolio value (linear)")
-            ax.set_title(f"Rolling Typical VALUE Path — Median only\n{caption}")
-            ax.grid(True, linewidth=0.3, alpha=0.5)
-            y_ticks, _ = _year_ticks(L, ppy)
-            ax.set_xticks(y_ticks)
-            ax.set_xticklabels([f"Y{i}" for i in range(1, len(y_ticks) + 1)])
+                # src is typical normalized price path Pn (median or fallback)
+                y = src
+
+                if is_dca:
+                    mask_bool = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
+                    inv_pn = 1.0 / np.clip(y, 1e-12, None)
+                    shares = float(initial_cap or 0.0) + float(amount or 0.0) * np.cumsum(
+                        inv_pn * mask_bool.astype(float))
+                    y_plot = y * shares
+                else:
+                    y_plot = y
+
+                ax.plot(step_arr, y_plot, label=series_label, linewidth=1.9, linestyle="-", zorder=5)
+
+                ax.annotate(
+                    f"{y_plot[-1]:,.0f}",
+                    xy=(step_arr[-1], y_plot[-1]),
+                    xytext=(5, 0),
+                    textcoords="offset points",
+                    va="center",
+                    fontsize=9,
+                    color="#333",
+                )
+
+            ax.set_ylabel("Portfolio amount")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+
+            if is_dca and amount and amount > 0:
+                ax2.set_ylabel("Contribution per period")
+                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+
             if is_dca and amount and amount > 0:
                 lines, labels = ax.get_legend_handles_labels()
                 lines2, labels2 = ax2.get_legend_handles_labels()
                 ax.legend(lines + lines2, labels + labels2, loc="best")
             else:
                 ax.legend(loc="best")
+
             plt.tight_layout()
-            save_with_watermarks(
-                output_dir / "typical_value_median_all_ports.png", dpi=150
-            )
+            save_with_watermarks(output_dir / "typical_value_median_all_ports.png", dpi=150)
     except Exception as e:
         print("[viz] Typical paths error:", e)
         pass
@@ -1701,8 +1875,86 @@ def save_charts_and_tables(
                 ax.legend(loc="best", frameon=True)
 
                 outname_img = f"{_safe_name(p)}_rep_{label.replace('%', 'P').replace(' ', '')}_stacked.png"
-                plt.tight_layout()
-                save_with_watermarks(output_dir / outname_img, dpi=150)
+
+                # Use the figure handle so it won't be closed by helper; we control the lifecycle.
+                fig = ax.figure
+                fig.tight_layout()
+                fig.savefig(output_dir / outname_img, dpi=150)
+
+                # --- Draw Max Drawdown / Max Drawup between bar-top points (smart text placement)
+                md, dd_i0, dd_i1 = _max_drawdown_with_idx(total_plot)
+                mu, up_i0, up_i1 = _max_drawup_non_overlapping(total_plot, (dd_i0, dd_i1))
+                dates_plot = pd.Series(dt_index)
+
+                # Clamp for safety
+                dd_i0 = int(np.clip(dd_i0, 0, len(total_plot) - 1))
+                dd_i1 = int(np.clip(dd_i1, 0, len(total_plot) - 1))
+                up_i0 = int(np.clip(up_i0, 0, len(total_plot) - 1))
+                up_i1 = int(np.clip(up_i1, 0, len(total_plot) - 1))
+
+                # Coordinates at bar tops
+                dd_x0, dd_y0 = dt_index[dd_i0], float(total_plot[dd_i0])  # peak -> trough
+                dd_x1, dd_y1 = dt_index[dd_i1], float(total_plot[dd_i1])
+                up_x0, up_y0 = dt_index[up_i0], float(total_plot[up_i0])  # trough -> peak
+                up_x1, up_y1 = dt_index[up_i1], float(total_plot[up_i1])
+
+                # Durations (days)
+                dd_days = _days_between(dates_plot, dd_i0, dd_i1)
+                up_days = _days_between(dates_plot, up_i0, up_i1)
+
+                # Final value tag position (already placed earlier at the last point)
+                final_xy = (dt_index[-1], float(total_plot[-1]))
+
+                # --- Red arrow (DD) ---
+                ax.annotate(
+                    "",
+                    xy=(dd_x1, dd_y1), xytext=(dd_x0, dd_y0),
+                    textcoords="data",
+                    arrowprops=dict(arrowstyle="-|>", color="red", lw=2.0),
+                    zorder=6,
+                )
+
+                (dd_offset, dd_ha, dd_va) = _smart_label_anchor(
+                    ax, dd_x1, dd_y1, final_xy=final_xy, prefer="left-down", dx=12, dy=12
+                )
+                ax.annotate(
+                    f"▼ Max Drawdown: {md:.2%}, {dd_days} days",
+                    xy=(dd_x1, dd_y1), xytext=dd_offset,
+                    textcoords="offset points",
+                    ha=dd_ha, va=dd_va,
+                    color="red", fontsize=11, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="red", alpha=0.95),
+                    zorder=7,
+                )
+
+                # --- Green arrow (DU) ---
+                ax.annotate(
+                    "",
+                    xy=(up_x1, up_y1), xytext=(up_x0, up_y0),
+                    textcoords="data",
+                    arrowprops=dict(arrowstyle="-|>", color="green", lw=2.0),
+                    zorder=6,
+                )
+
+                (up_offset, up_ha, up_va) = _smart_label_anchor(
+                    ax, up_x1, up_y1, final_xy=final_xy, prefer="right-up", dx=12, dy=12
+                )
+                ax.annotate(
+                    f"▲ Max Drawup: {mu:.2%}, {up_days} days",
+                    xy=(up_x1, up_y1), xytext=up_offset,
+                    textcoords="offset points",
+                    ha=up_ha, va=up_va,
+                    color="green", fontsize=11, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="green", alpha=0.95),
+                    zorder=7,
+                )
+
+                # Save decorated variant
+                annotated_name = outname_img.replace(".png", "_annotated.png")
+                fig.tight_layout()
+                fig.savefig(output_dir / annotated_name, dpi=150)
+                import matplotlib.pyplot as _plt
+                _plt.close(fig)
 
                 # ---------- CSV（従来のネイティブ＋プロット後の2種） ----------
                 cmask = item.get("contrib_mask", None)

@@ -23,51 +23,93 @@ def _rolling_prices_from_returns(returns: np.ndarray) -> np.ndarray:
 def _batched_path_extrema_draws_stream(Pn_windows: np.ndarray, *, batch_size: int = 256):
     """
     Memory-safe path-extrema computation by streaming over the time axis.
+
     Inputs
     ------
-    Pn_windows : np.ndarray, shape (nW, W), float32 (view is fine)
-        Normalized price paths (start=1).
+    Pn_windows : (nW, W) float32
+        Normalized price paths (start=1) per rolling window.
+
     Returns
     -------
-    path_min, path_max, max_up, max_dd : float32 arrays of shape (nW,)
+    path_min, path_max, max_up_nonoverlap, max_dd : float32 arrays of shape (nW,)
+        NOTE: max_up_nonoverlap is computed so that its interval does NOT overlap
+        the Max Drawdown interval within each window (Max Drawdown has priority).
     """
     nW, W = Pn_windows.shape
     path_min = np.empty((nW,), dtype=np.float32)
     path_max = np.empty((nW,), dtype=np.float32)
-    max_up   = np.empty((nW,), dtype=np.float32)
     max_dd   = np.empty((nW,), dtype=np.float32)
+    # Non-overlapping drawup result
+    max_up_nonoverlap = np.zeros((nW,), dtype=np.float32)
 
-    b = max(1, int(batch_size))
-    for i in range(0, nW, b):
-        j = min(i + b, nW)
-        v = Pn_windows[i:j, :]  # (B, W) view
+    # To capture Max Drawdown indices per window
+    dd_i0_all = np.zeros((nW,), dtype=np.int32)
+    dd_i1_all = np.zeros((nW,), dtype=np.int32)
 
-        # Initialize with first column
+    B = max(1, int(batch_size))
+    for i in range(0, nW, B):
+        j = min(i + B, nW)
+        v = Pn_windows[i:j, :]  # (B, W)
+        B_now = v.shape[0]
+
+        # First pass: path_min/max and MaxDD with indices
         col0 = v[:, 0]
         cur_min = col0.copy()
         cur_max = col0.copy()
         pmin = col0.copy()
         pmax = col0.copy()
-        up = np.zeros_like(col0, dtype=np.float32)
-        dd = np.zeros_like(col0, dtype=np.float32)  # drawdown is <= 0
+        dd = np.zeros_like(col0, dtype=np.float32)
+        peak_idx = np.zeros((B_now,), dtype=np.int32)
+        dd_i0 = np.zeros((B_now,), dtype=np.int32)
+        dd_i1 = np.zeros((B_now,), dtype=np.int32)
 
-        # Stream over columns 1..W-1
         for k in range(1, W):
             col = v[:, k]
-            cur_min = np.minimum(cur_min, col)
+            # track peak (for Drawdown)
+            new_peak = col > cur_max
+            peak_idx = np.where(new_peak, k, peak_idx)
             cur_max = np.maximum(cur_max, col)
+            cand_dd = (col / np.maximum(cur_max, 1e-12)) - 1.0
+            better_dd = cand_dd < dd
+            dd = np.where(better_dd, cand_dd, dd)
+            dd_i0 = np.where(better_dd, peak_idx, dd_i0)
+            dd_i1 = np.where(better_dd, k, dd_i1)
+
+            # generic path stats
+            cur_min = np.minimum(cur_min, col)
             pmin = np.minimum(pmin, col)
             pmax = np.maximum(pmax, col)
-            up = np.maximum(up, (col / cur_min) - 1.0)
-            dd = np.minimum(dd, (col / cur_max) - 1.0)
 
         path_min[i:j] = pmin
         path_max[i:j] = pmax
-        max_up[i:j]   = up
         max_dd[i:j]   = dd
+        dd_i0_all[i:j] = dd_i0
+        dd_i1_all[i:j] = dd_i1
 
-    return path_min, path_max, max_up, max_dd
+        # Second pass (per row): max drawup on left [0..i0-1] and right [i1+1..W-1]
+        # then pick the larger (ties -> right).
+        def _max_du_segment(a: np.ndarray) -> float:
+            if a.size < 2:
+                return 0.0
+            trough = float(a[0])
+            best = 0.0
+            for t in range(1, a.size):
+                x = float(a[t])
+                if x < trough:
+                    trough = x
+                up = (x / max(trough, 1e-12)) - 1.0
+                if up > best:
+                    best = up
+            return float(best)
 
+        for r in range(B_now):
+            i0 = int(dd_i0[r]); i1 = int(dd_i1[r])
+            y = v[r, :]
+            upL = _max_du_segment(y[:max(0, i0)])
+            upR = _max_du_segment(y[min(W, i1 + 1):])
+            max_up_nonoverlap[i + r] = float(upR if upR >= upL else upL)
+
+    return path_min, path_max, max_up_nonoverlap.astype(np.float32), max_dd
 
 def calculate_rolling_metrics(
     returns: np.ndarray,
