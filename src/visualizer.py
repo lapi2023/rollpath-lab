@@ -16,19 +16,35 @@ from rich.console import Console
 from rich.table import Table
 
 # --- Add/Replace inside _smart_label_anchor ---
+# --- REPLACED: smarter label anchor with explicit side & vertical preference ---
 import matplotlib.dates as _mdates
 
-def _smart_label_anchor(ax, x_data, y_data, *,
-                        final_xy=None,
-                        prefer="right-up",
-                        dx=8, dy=10):
+def _smart_label_anchor(
+    ax,
+    x_data,
+    y_data,
+    *,
+    final_xy=None,
+    dx=8,
+    dy=10,
+    force_side: str = None,  # 'left' | 'right' | None
+    prefer_v: str = None,    # 'up'   | 'down'  | None
+):
     """
     Decide (xytext, ha, va) so that the text stays inside axes and avoids
-    the final value label when it is too close.
-    """
-    x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+    collision with the final value tag when it is too close.
 
-    # Convert x_data (and final x) to axis numeric units (date -> float days)
+    New behavior:
+      - force_side: force the horizontal side of the label ("left" or "right")
+      - prefer_v  : bias vertical placement ("up" for drawup, "down" for drawdown)
+    This function auto-flips near edges to keep labels inside the axes.
+    """
+
+    # Axis limits in data units
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+
+    # Convert x (and final x) to numeric axis units (e.g., date -> float days)
     def _x_to_num(x):
         try:
             return _mdates.date2num(x)
@@ -36,41 +52,70 @@ def _smart_label_anchor(ax, x_data, y_data, *,
             try:
                 return float(x)
             except Exception:
-                return x0 + 0.5*(x1 - x0)
+                return x0 + 0.5 * (x1 - x0)
 
-    x_data_num = _x_to_num(x_data)
+    xd = _x_to_num(x_data)
     fx_num = _x_to_num(final_xy[0]) if final_xy is not None else None
 
-    xr = 0.5 if x1 == x0 else (x_data_num - x0) / (x1 - x0)
+    xr = 0.5 if x1 == x0 else (xd - x0) / (x1 - x0)
     yr = 0.5 if y1 == y0 else (y_data - y0) / (y1 - y0)
 
-    # Base direction from preference
-    base_dx = dx if "right" in prefer else -dx
-    base_dy = dy if "up"    in prefer else -dy
-    ha = "left"  if base_dx > 0 else "right"
-    va = "bottom" if base_dy > 0 else "top"
+    # Base horizontal: left/right
+    if str(force_side or "").lower() == "left":
+        base_dx = -abs(dx);  ha = "right"
+    elif str(force_side or "").lower() == "right":
+        base_dx = +abs(dx);  ha = "left"
+    else:
+        # fallback: choose based on where we are
+        if xr >= 0.5:
+            base_dx = -abs(dx); ha = "right"
+        else:
+            base_dx = +abs(dx); ha = "left"
 
-    # Keep inside: flip near edges
-    if xr > 0.88 and base_dx > 0:  # right edge
-        base_dx = -dx; ha = "right"
-    if xr < 0.12 and base_dx < 0:  # left edge
-        base_dx = dx;  ha = "left"
-    if yr > 0.90 and base_dy > 0:  # top edge
-        base_dy = -dy; va = "top"
-    if yr < 0.10 and base_dy < 0:  # bottom edge
-        base_dy = dy;  va = "bottom"
+    # Base vertical: up/down
+    if str(prefer_v or "").lower() == "up":
+        base_dy = +abs(dy);  va = "bottom"
+    elif str(prefer_v or "").lower() == "down":
+        base_dy = -abs(dy);  va = "top"
+    else:
+        # fallback by position
+        if yr >= 0.5:
+            base_dy = -abs(dy); va = "top"
+        else:
+            base_dy = +abs(dy); va = "bottom"
+
+    # Keep inside horizontally (near left/right edges)
+    if xr > 0.88 and base_dx > 0:  # too close to right edge but pointing right
+        base_dx = -abs(dx); ha = "right"
+    if xr < 0.12 and base_dx < 0:  # too close to left edge but pointing left
+        base_dx = +abs(dx); ha = "left"
+
+    # Keep inside vertically (near top/bottom edges)
+    if yr > 0.90 and base_dy > 0:  # near top
+        base_dy = -abs(dy); va = "top"
+    if yr < 0.10 and base_dy < 0:  # near bottom
+        base_dy = +abs(dy); va = "bottom"
 
     # Avoid collision with the final value tag (if provided)
     if final_xy is not None and fx_num is not None:
-        near_x = abs(x_data_num - fx_num) < 6.0  # ~ 6 days
+        near_x = abs(xd - fx_num) < 6.0  # ~6 days for date axis
         near_y = abs(y_data - final_xy[1]) / max((y1 - y0), 1e-6) < 0.10
         if near_x and near_y:
             base_dy = -base_dy
             va = "top" if va == "bottom" else "bottom"
+            # if still near right edge, flip horizontal too
             if xr > 0.92 and base_dx > 0:
-                base_dx = -dx; ha = "right"
+                base_dx = -abs(dx); ha = "right"
 
     return (base_dx, base_dy), ha, va
+
+# ---decide left/right sides from segment centers in axis units ---
+def _segment_center_num(dates, i0: int, i1: int) -> float:
+    x0 = _mdates.date2num(dates[i0]) if i0 is not None else None
+    x1 = _mdates.date2num(dates[i1]) if i1 is not None else None
+    if x0 is None or x1 is None:
+        return float("nan")
+    return 0.5 * (float(x0) + float(x1))
 
 def _max_drawdown_with_idx(y: np.ndarray) -> Tuple[float, int, int]:
     """
@@ -113,7 +158,15 @@ def _max_drawup_with_idx(y: np.ndarray) -> Tuple[float, int, int]:
     return float(max_up), int(up_i0), int(up_i1)
 
 # --- compute max drawup that does NOT overlap a locked segment (e.g., Max Drawdown) ---
-def _max_drawup_non_overlapping(y: np.ndarray, lock_range: Optional[Tuple[int, int]] = None) -> Tuple[float, int, int]:
+
+def _max_drawup_non_overlapping(
+    y: np.ndarray,
+    lock_range: Optional[Tuple[int, int]] = None,
+    *,
+    prefer_side: str = "either",  # "either" | "right" | "left"
+    tol: float = 1e-12,
+) -> Tuple[float, int, int]:
+
     """
     Return the max drawup (>= 0) on y that does NOT overlap a locked segment.
     Backward-compatible:
@@ -151,9 +204,20 @@ def _max_drawup_non_overlapping(y: np.ndarray, lock_range: Optional[Tuple[int, i
     if upL > 0.0:
         return upL, sL, eL
 
+
+    ps = (prefer_side or "either").lower()
+    if ps == "right":
+        if upR > tol: return upR, sR, eR
+        if upL > tol: return upL, sL, eL
+    elif ps == "left":
+        if upL > tol: return upL, sL, eL
+        if upR > tol: return upR, sR, eR
+
+
     # Fallback: zero-length anchor next to the locked region
     anchor = i0 - 1 if i0 - 1 >= 0 else (i1 + 1 if i1 + 1 < n else i0)
     return 0.0, anchor, anchor
+
 def _days_between(dts: pd.Series, i0: int, i1: int) -> int:
     try:
         d0, d1 = pd.to_datetime(dts.iloc[i0]), pd.to_datetime(dts.iloc[i1])
@@ -1332,10 +1396,10 @@ def save_charts_and_tables(
                 "  - Risk/Sharpe: Computed on price-path basis; drawup/down from normalized paths.",
                 "  - Max DD(Drawdown): Max cumulative fall from rolling normalized path.",
                 "  - Max Drawup:Computed on segments that do NOT overlap the Max Drawdown interval "
-                "within the SAME rolling window. The Max Drawdown interval is locked FIRST (priority), "
-                "then Max Drawup is searched only on the LEFT or RIGHT side of that interval; ties "
-                "prefer the RIGHT side. "
-                "This policy ensures Max Drawup starts/ends either BEFORE or AFTER the Max Drawdown.",
+                "within the SAME rolling window. The Max Drawdown interval is locked FIRST (priority), \n"
+                "then Max Drawup is searched only on the LEFT or RIGHT side of that interval; "
+                "ties prefer the RIGHT side.\n"
+                "This policy ensures Max Drawup starts/ends either BEFORE or AFTER the Max Drawdown."
                 "Assumptions: data freq sets ppy; DCA schedule follows '--dca-interval'; last period has no new contribution.",
             ]
         else:
@@ -1881,31 +1945,52 @@ def save_charts_and_tables(
                 fig.tight_layout()
                 fig.savefig(output_dir / outname_img, dpi=150)
 
-                # --- Draw Max Drawdown / Max Drawup between bar-top points (smart text placement)
-                md, dd_i0, dd_i1 = _max_drawdown_with_idx(total_plot)
-                mu, up_i0, up_i1 = _max_drawup_non_overlapping(total_plot, (dd_i0, dd_i1))
-                dates_plot = pd.Series(dt_index)
+                # --- Draw Max Drawdown / Max Drawup between bar-top points (compute on NATIVE series) ---
 
-                # Clamp for safety
-                dd_i0 = int(np.clip(dd_i0, 0, len(total_plot) - 1))
-                dd_i1 = int(np.clip(dd_i1, 0, len(total_plot) - 1))
-                up_i0 = int(np.clip(up_i0, 0, len(total_plot) - 1))
-                up_i1 = int(np.clip(up_i1, 0, len(total_plot) - 1))
+                # 1) Compute on native (daily) VALUE series to avoid losing peaks/troughs
+                total_native = df["TotalValue"].to_numpy(dtype=float, copy=False)
+                dates_native = pd.Series(pd.DatetimeIndex(df.index).to_pydatetime())
 
-                # Coordinates at bar tops
-                dd_x0, dd_y0 = dt_index[dd_i0], float(total_plot[dd_i0])  # peak -> trough
-                dd_x1, dd_y1 = dt_index[dd_i1], float(total_plot[dd_i1])
-                up_x0, up_y0 = dt_index[up_i0], float(total_plot[up_i0])  # trough -> peak
-                up_x1, up_y1 = dt_index[up_i1], float(total_plot[up_i1])
+                md, dd_i0_n, dd_i1_n = _max_drawdown_with_idx(total_native)
+                mu, up_i0_n, up_i1_n = _max_drawup_non_overlapping(
+                    total_native, (dd_i0_n, dd_i1_n), prefer_side="either"  # keep definition; 'right' is also ok
+                )
 
-                # Durations (days)
-                dd_days = _days_between(dates_plot, dd_i0, dd_i1)
-                up_days = _days_between(dates_plot, up_i0, up_i1)
+                # 2) Debug log (console)
+                # try:
+                #     print(
+                #         f"[viz]{p}[DU/DD] DD {md:.2%} {dates_native.iloc[dd_i0_n].date()}→{dates_native.iloc[dd_i1_n].date()} | "
+                #         f"DU {mu:.2%} {dates_native.iloc[up_i0_n].date()}→{dates_native.iloc[up_i1_n].date()}"
+                #     )
+                # except Exception:
+                #     pass
 
-                # Final value tag position (already placed earlier at the last point)
+                # 3) Fallback: if DU is zero-length or <=0 (shouldn't happen; but keep robust)
+                if not np.isfinite(mu) or mu <= 0.0 or up_i0_n == up_i1_n:
+                    if dd_i1_n < len(total_native) - 1:
+                        mu = (total_native[-1] / total_native[dd_i1_n]) - 1.0
+                        up_i0_n, up_i1_n = dd_i1_n, len(total_native) - 1
+
+                # Clamp indices for safety
+                dd_i0_n = int(np.clip(dd_i0_n, 0, len(total_native) - 1))
+                dd_i1_n = int(np.clip(dd_i1_n, 0, len(total_native) - 1))
+                up_i0_n = int(np.clip(up_i0_n, 0, len(total_native) - 1))
+                up_i1_n = int(np.clip(up_i1_n, 0, len(total_native) - 1))
+
+                # Coordinates at native dates (annotation supports arbitrary dates on date-axis)
+                dd_x0, dd_y0 = dates_native.iloc[dd_i0_n], float(total_native[dd_i0_n])
+                dd_x1, dd_y1 = dates_native.iloc[dd_i1_n], float(total_native[dd_i1_n])
+                up_x0, up_y0 = dates_native.iloc[up_i0_n], float(total_native[up_i0_n])
+                up_x1, up_y1 = dates_native.iloc[up_i1_n], float(total_native[up_i1_n])
+
+                # Durations
+                dd_days = _days_between(dates_native, dd_i0_n, dd_i1_n)
+                up_days = _days_between(dates_native, up_i0_n, up_i1_n)
+
+                # (collision guard) keep using the resampled final tag
                 final_xy = (dt_index[-1], float(total_plot[-1]))
 
-                # --- Red arrow (DD) ---
+                # --- draw red (DD) ---
                 ax.annotate(
                     "",
                     xy=(dd_x1, dd_y1), xytext=(dd_x0, dd_y0),
@@ -1914,9 +1999,34 @@ def save_charts_and_tables(
                     zorder=6,
                 )
 
-                (dd_offset, dd_ha, dd_va) = _smart_label_anchor(
-                    ax, dd_x1, dd_y1, final_xy=final_xy, prefer="left-down", dx=12, dy=12
-                )
+                # Decide relative sides (DU vs DD)
+                du_c = _segment_center_num(dates_native, up_i0_n, up_i1_n)
+                dd_c = _segment_center_num(dates_native, dd_i0_n, dd_i1_n)
+                if not np.isfinite(du_c) or not np.isfinite(dd_c):
+                    du_side, dd_side = "right", "left"
+                else:
+                    du_side = "left" if (du_c <= dd_c) else "right"
+                    dd_side = "right" if du_side == "left" else "left"
+                du_v, dd_v = "up", "down"
+
+                # Anchors (robust fallback if smart anchor fails)
+                try:
+                    (dd_offset, dd_ha, dd_va) = _smart_label_anchor(
+                        ax, dd_x1, dd_y1, final_xy=final_xy, dx=12, dy=12,
+                        force_side=dd_side, prefer_v=dd_v,
+                    )
+                except Exception:
+                    (dd_offset, dd_ha, dd_va) = ((-12, -12), "right", "top")
+
+                try:
+                    (up_offset, up_ha, up_va) = _smart_label_anchor(
+                        ax, up_x1, up_y1, final_xy=final_xy, dx=12, dy=12,
+                        force_side=du_side, prefer_v=du_v,
+                    )
+                except Exception:
+                    (up_offset, up_ha, up_va) = ((12, 12), "left", "bottom")
+
+                # Labels
                 ax.annotate(
                     f"▼ Max Drawdown: {md:.2%}, {dd_days} days",
                     xy=(dd_x1, dd_y1), xytext=dd_offset,
@@ -1927,17 +2037,13 @@ def save_charts_and_tables(
                     zorder=7,
                 )
 
-                # --- Green arrow (DU) ---
+                # --- draw green (DU) ---
                 ax.annotate(
                     "",
                     xy=(up_x1, up_y1), xytext=(up_x0, up_y0),
                     textcoords="data",
                     arrowprops=dict(arrowstyle="-|>", color="green", lw=2.0),
                     zorder=6,
-                )
-
-                (up_offset, up_ha, up_va) = _smart_label_anchor(
-                    ax, up_x1, up_y1, final_xy=final_xy, prefer="right-up", dx=12, dy=12
                 )
                 ax.annotate(
                     f"▲ Max Drawup: {mu:.2%}, {up_days} days",

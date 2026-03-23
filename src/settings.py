@@ -153,16 +153,16 @@ PORTFOLIOS = {
     # "sim_QLD": {"QLD_2x_TR": 1.0},
     # "sim_TQQQ": {"TQQQ_3x_TR": 1.0},
     #
-    # "S&P500 25/75 SSO": {"SP500_TR": 0.25, "SSO_2x_TR": 0.75},
-    # "S&P500 50/50 SSO": {"SP500_TR": 0.5,  "SSO_2x_TR": 0.5},
-    # "S&P500 75/25 SSO": {"SP500_TR": 0.75, "SSO_2x_TR": 0.25},
-    #
-    # "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
-    # "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
-    # "S&P500 75/25 SPXL": {"SP500_TR": 0.75, "SPXL_3x_TR": 0.25},
-    # "SSO 25/75 SPXL": {"SSO_2x_TR": 0.25, "SPXL_3x_TR": 0.75},
-    # "SSO 50/50 SPXL": {"SSO_2x_TR": 0.5, "SPXL_3x_TR": 0.5},
-    # "SSO 75/25 SPXL": {"SSO_2x_TR": 0.75, "SPXL_3x_TR": 0.25},
+    "S&P500 25/75 SSO": {"SP500_TR": 0.25, "SSO_2x_TR": 0.75},
+    "S&P500 50/50 SSO": {"SP500_TR": 0.5,  "SSO_2x_TR": 0.5},
+    "S&P500 75/25 SSO": {"SP500_TR": 0.75, "SSO_2x_TR": 0.25},
+
+    "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
+    "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
+    "S&P500 75/25 SPXL": {"SP500_TR": 0.75, "SPXL_3x_TR": 0.25},
+    "SSO 25/75 SPXL": {"SSO_2x_TR": 0.25, "SPXL_3x_TR": 0.75},
+    "SSO 50/50 SPXL": {"SSO_2x_TR": 0.5, "SPXL_3x_TR": 0.5},
+    "SSO 75/25 SPXL": {"SSO_2x_TR": 0.75, "SPXL_3x_TR": 0.25},
     # "SPXL 50/Cash 50": {"SPXL_3x_TR": 0.50, "CASH": 0.50},  If you want cash in portoflio
 }
 
