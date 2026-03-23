@@ -16,7 +16,36 @@ from matplotlib import font_manager, rcParams
 from rich.console import Console
 from rich.table import Table
 
+# unified foot-lines helper (place footnote outside the axes, bottom-right) ---
+# --- REPLACE _add_foot_lines with this version ---
+def _add_foot_lines(fig, text: str, *, max_fontsize: int = 6, bottom_pad: float | None = None, ha: str = "right") -> None:
+    """
+    Place explanatory foot lines at the bottom-right *outside* of the matrix/table axes,
+    so they never overlap the main content. Computes bottom margin in figure fraction
+    using physical size (inches) and dpi to ensure enough space for multi-line notes.
+    """
+    lines = 1 if not text else text.count("\n") + 1
 
+    # Physical sizing → required bottom inches for the footnote block.
+    fig_h_in = float(fig.get_size_inches()[1])
+    dpi = float(fig.dpi or 100.0)
+    line_px = float(max_fontsize) * 1.25
+    need_in = (lines * line_px) / dpi + 0.08  # +0.08in: 余白の安全域
+
+    need_frac = min(0.45, max(need_in / max(fig_h_in, 1e-6), 0.12))
+    pad = max(need_frac, float(bottom_pad) if bottom_pad is not None else 0.0)
+
+    try:
+        fig.subplots_adjust(bottom=pad)
+    except Exception:
+        pass
+
+    fig.text(
+        0.995, 0.01,
+        text or "",
+        ha=ha, va="bottom",
+        fontsize=int(max_fontsize), color="#555555"
+    )
 # =============================================================================
 # Font (force a CJK-capable family to avoid missing glyphs)
 # =============================================================================
@@ -60,15 +89,14 @@ if not _CHOSEN_CJK:
 # =============================================================================
 # Save (delegate watermark)
 # =============================================================================
+
 def save_with_watermarks(filepath: Path, dpi: int = 300, bbox_inches=None) -> None:
+    """
+    Save the current Matplotlib figure WITHOUT any watermark overlay.
+    Watermarking is handled in a separate project; this project intentionally saves clean images.
+    """
     filepath.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from . import watermark as _wm  # type: ignore
-
-        _wm.save_with_watermarks(filepath=filepath, dpi=dpi, bbox_inches=bbox_inches)
-    except Exception:
-        plt.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches)
+    plt.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches)
     plt.close()
 
 
@@ -160,6 +188,69 @@ def _get_array(d: dict, keys: List[str]) -> np.ndarray:
                 pass
     return np.asarray([], dtype=float)
 
+def _get_final_value_vector(results: dict, name: str) -> np.ndarray:
+    """
+    Return per-window Final Value vector for a portfolio. If missing,
+    fall back to Return as an order-preserving proxy (1 + return).
+    """
+    m = results.get(name, {})
+    fv = _get_array(m, ["Final_Value"])
+    if fv.size > 0:
+        return fv.astype(float, copy=False)
+    r = _get_array(m, ["Return"])
+    return (1.0 + r) if r.size > 0 else np.asarray([], dtype=float)
+
+
+def _compute_win_rate_matrix(
+    portfolio_names: List[str],
+    results: dict,
+    *,
+    tie_policy: str = "exclude"  # "exclude" (default) or "half"
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Pairwise win-rate matrix based on per-window Final Value vectors.
+
+    win_rate[i,j] = % of windows where FinalValue_i > FinalValue_j
+    Denominator:
+      - "exclude": ties are excluded
+      - "half":    ties count as 0.5 win each (denominator = #windows)
+    """
+    n = len(portfolio_names)
+    win_rate = np.full((n, n), np.nan, dtype=float)
+    denom = np.zeros((n, n), dtype=float)
+
+    vecs = [_get_final_value_vector(results, p) for p in portfolio_names]
+
+    for i in range(n):
+        vi = vecs[i]
+        if vi.size == 0:
+            continue
+        for j in range(n):
+            vj = vecs[j]
+            if vj.size == 0:
+                continue
+            L = int(min(vi.size, vj.size))
+            if L <= 0:
+                continue
+
+            a = vi[:L]
+            b = vj[:L]
+            gt = (a > b)
+            eq = (a == b)
+
+            if tie_policy == "half":
+                wins = gt.sum(dtype=float) + 0.5 * eq.sum(dtype=float)
+                d = float(L)
+            else:  # "exclude"
+                not_tie = ~eq
+                wins = np.logical_and(gt, not_tie).sum(dtype=float)
+                d = float(not_tie.sum(dtype=float))
+
+            wr = (wins / d * 100.0) if d > 0 else np.nan
+            win_rate[i, j] = wr
+            denom[i, j] = d
+
+    return win_rate, denom.astype(int, copy=False)
 
 def _get_scalar(d: dict, keys: List[str], default: float = np.nan) -> float:
     for k in keys:
@@ -645,40 +736,51 @@ def print_summary_table(
         console.print(summary_table)
 
 
+# CHANGED: hide "(n=...)" and colorize cells (>50% green, <50% red)
+from typing import List
+import numpy as np
+from rich.console import Console
+from rich.table import Table
+
 def print_win_rate_table(
-    console: Console, portfolio_names: List[str], results: dict
+    console: Console,
+    portfolio_names: List[str],
+    results: dict,
+    tie_policy: str = "exclude",
 ) -> None:
-    # NOTE: Text import may be needed if not already imported where used.
-    from rich.text import Text
-
-    title = Text(
-        "Win Rate Matrix (Row returns > Column returns)",
-        no_wrap=True,
-        overflow="ignore",
+    """
+    Print pairwise win-rate matrix based on per-window Final Value vectors.
+    Display rule:
+      - Value-only percentage (no sample size "n=...").
+      - > 50% shown in green, < 50% shown in red, exactly 50% shown in default color.
+    """
+    win_rate, denom = _compute_win_rate_matrix(
+        portfolio_names, results, tie_policy=tie_policy
     )
-    win_rate_table = Table(title=title)
-    win_rate_table.add_column("Portfolio", style="cyan", no_wrap=True)
-    for p in portfolio_names:
-        win_rate_table.add_column(p, justify="right", no_wrap=True)
-    for p1 in portfolio_names:
-        row = [f"[bold]{p1}[/]"]
-        for p2 in portfolio_names:
-            if p1 == p2:
-                row.append("-")
-                continue
-            r1 = _get_array(results.get(p1, {}), ["Return"])
-            r2 = _get_array(results.get(p2, {}), ["Return"])
-            if r1.size == 0 or r2.size == 0:
-                row.append("—")
-            else:
-                wins = np.sum(r1 > r2)
-                total = min(len(r1), len(r2))
-                wr = wins / total if total else 0.0
-                color = "green" if wr > 0.5 else "red"
-                row.append(f"[{color}]{wr:.2%}[/]")
-        win_rate_table.add_row(*row)
-    console.print(win_rate_table)
 
+    tb = Table(title="Win Rate Matrix (Row Final Value > Column Final Value, %)")
+    tb.add_column("Portfolio", style="bold")
+    for name in portfolio_names:
+        tb.add_column(name)
+
+    for i, row_name in enumerate(portfolio_names):
+        row_cells = []
+        for j, _ in enumerate(portfolio_names):
+            if i == j:
+                row_cells.append("—")
+                continue
+            wr = win_rate[i, j]
+            if np.isfinite(wr):
+                # Colorize: >50% green, <50% red
+                style = "green" if wr > 50.0 else ("red" if wr < 50.0 else "")
+                text = f"{wr:.1f}%"
+                cell = f"[{style}]{text}[/{style}]" if style else text
+            else:
+                cell = "n/a"
+            row_cells.append(cell)
+        tb.add_row(row_name, *row_cells)
+
+    console.print(tb)
 
 # =============================================================================
 # Charts + CSV exports
@@ -804,35 +906,67 @@ def save_charts_and_tables(
     save_with_watermarks(output_dir / "return_boxplot.png")
 
     # ---------- (3) Win Rate Matrix ----------
-    wr = np.full((n_ports, n_ports), np.nan, dtype=float)
-    for i, p1 in enumerate(portfolio_names):
-        for j, p2 in enumerate(portfolio_names):
+    # Pairwise Final Value comparison per rolling window (ties excluded by default)
+    win_rate, denom = _compute_win_rate_matrix(
+        portfolio_names, results, tie_policy="exclude"
+    )
+
+    n_ports = len(portfolio_names)
+    fig_w = max(8.0, min(1.4 * n_ports + 2.0, 28.0))
+    fig_h = max(8.0, min(1.6 * n_ports + 1.5, 24.0))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # Prepare heatmap values and annotations
+    display = np.nan_to_num(win_rate, nan=0.0)  # colormap only
+    annot = np.empty_like(display, dtype=object)
+    for i in range(n_ports):
+        for j in range(n_ports):
             if i == j:
-                continue
-            r1 = _get_array(results.get(p1, {}), ["Return"])
-            r2 = _get_array(results.get(p2, {}), ["Return"])
-            if r1.size == 0 or r2.size == 0:
-                wr[i, j] = np.nan
+                annot[i, j] = "—"
             else:
-                wins = np.sum(r1 > r2)
-                total = min(len(r1), len(r2))
-                wr[i, j] = wins / total if total else np.nan
-    plt.figure(figsize=(max(8, n_ports * 1.5), max(6, n_ports * 1.2)))
+                v = win_rate[i, j]
+                n_eff = int(denom[i, j])
+                annot[i, j] = "n/a" if (not np.isfinite(v) or n_eff <= 0) else f"{v:.1f}%\n(n={n_eff})"
+
     sns.heatmap(
-        wr * 100,
-        annot=True,
-        fmt=".1f",
+        display,
+        annot=annot,
+        fmt="",
         cmap="RdYlGn",
         center=50,
+        vmin=0, vmax=100,
         xticklabels=portfolio_names,
         yticklabels=portfolio_names,
         cbar_kws={"label": "Win Rate (%)"},
+        ax=ax,
     )
-    plt.title(f"Win Rate Matrix (%)[Row > Column]\n{caption}", fontsize=12, pad=15)
-    plt.tight_layout()
-    save_with_watermarks(output_dir / "win_rate_matrix.png")
 
-    # ---------- (4) Performance Summary Table ----------
+    ax.set_title(
+        f"Win Rate Matrix (%) [Row Final Value > Column Final Value]\n{caption}",
+        fontsize=12, pad=15
+    )
+
+    # --- foot lines (outside, bottom-right; font size <= 6) ---
+    foot_lines = [
+        "Win Rate Matrix (row vs. column)",
+        "• Same rolling horizon only; one comparison per window.",
+        "• A 'win' counts when Final_Value_row > Final_Value_col.",
+        "• Ties are excluded from the denominator.",
+    ]
+    if (style or "").lower() == "dca":
+        foot_lines += [
+            "• Final_Value = portfolio value with start-of-period contributions,",
+            f"  (initial={initial_cap:,.0f}, amount={amount:,.0f}, interval={dca_interval or 'every_period'}).",
+        ]
+    else:
+        foot_lines += [
+            "• Final_Value = initial_cap × (end_price / start_price).",
+            f"  (initial={initial_cap:,.0f}).",
+        ]
+    _add_foot_lines(fig, "\n".join(foot_lines), max_fontsize=6)
+
+    save_with_watermarks(output_dir / "win_rate_matrix.png", bbox_inches="tight")
+
     # ---------- (4) Performance Summary Table ----------
     try:
         use_dca_value_table = is_dca
@@ -1036,16 +1170,44 @@ def save_charts_and_tables(
                     ]
                 )
 
-        # ---- build PNG (unchanged) ----
-        fig = plt.figure(figsize=(21, 9.8))
-        gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3.2, 3.2, 2.0])
+        # ---- build PNG----
+        fig_w = max(14.0, min(6.0 + 1.20 * n_ports, 32.0))
+        fig_h = 8.5 if n_ports <= 6 else min(8.5 + 0.35 * (n_ports - 6), 14.0)
 
-        # Top
+        # --- Prepare notes text early (to size the bottom panel dynamically) ---
+        if use_dca_value_table:
+            notes_lines = [
+                "Notes (DCA):",
+                "• Top — Final Value distribution (currency) across rolling windows.",
+                "• Middle — Medians across windows:",
+                "  - Path Min/Max (Med): Median of within-window portfolio VALUE min/max "
+                "(contributions at period start; none at last step).",
+                "  - Tot CAGR (Simple, Med): Principal-based annualized rate with total contributed principal (I0 + A × #contrib).",
+                "  - IRR (Med): Money-weighted return solved from the median Final Value and the DCA cash-flow schedule.",
+                "  - Risk/Sharpe/Max Drawup/Max DD: Computed on price-path basis; drawup/down from normalized paths.",
+                "Assumptions: data freq sets ppy; DCA schedule follows '--dca-interval'; last period has no new contribution.",
+            ]
+        else:
+            notes_lines = [
+                "Notes (Lump Sum):",
+                "• Top — Return distribution (%, rolling windows) across portfolios.",
+                "• Middle — Medians across windows:",
+                "  - Path Min/Max (Med): Median of within-window normalized path extrema (start=1).",
+                "  - CAGR/Risk/Sharpe: Standard annualization with ppy set by '--freq'.",
+                "  - Max Drawup/Max DD: Max cumulative rise/fall from rolling normalized path.",
+            ]
+        notes_text = "\n".join(notes_lines)
+        n_note_lines = notes_text.count("\n") + 1
+        # Bottom panel height (relative) grows gently with note lines (clamped)
+        h_bot = min(3.5, max(1.2, 0.16 * n_note_lines))
+
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3.2, 3.2, h_bot])
+
+        # --- Top table ---
         ax_top = fig.add_subplot(gs[0, 0])
         ax_top.axis("off")
-        tab_top = ax_top.table(
-            cellText=rows_top, colLabels=cols_top, loc="center", cellLoc="center"
-        )
+        tab_top = ax_top.table(cellText=rows_top, colLabels=cols_top, loc="center", cellLoc="center")
         tab_top.auto_set_font_size(False)
         tab_top.set_fontsize(10)
         tab_top.scale(1.0, 1.20)
@@ -1056,28 +1218,20 @@ def save_charts_and_tables(
             elif j == 0:
                 cell.set_text_props(weight="bold")
             try:
-                fam = (
-                        _CHOSEN_CJK
-                        or (rcParams.get("font.family") or [""])[0]
-                        or "sans-serif"
-                )
+                fam = (_CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif")
                 cell.get_text().set_fontfamily(fam)
             except Exception:
                 pass
         cap_mode = "DCA (values)" if use_dca_value_table else "Returns"
         ax_top.set_title(
             f"Performance Summary — Top: Mean to Max ({val} {unit}) [{cap_mode}]\n{caption}",
-            fontsize=12,
-            fontweight="bold",
-            pad=1,
+            fontsize=12, fontweight="bold", pad=1,
         )
 
-        # Middle
+        # --- Middle table ---
         ax_mid = fig.add_subplot(gs[1, 0])
         ax_mid.axis("off")
-        tab_mid = ax_mid.table(
-            cellText=rows_mid, colLabels=cols_mid, loc="center", cellLoc="center"
-        )
+        tab_mid = ax_mid.table(cellText=rows_mid, colLabels=cols_mid, loc="center", cellLoc="center")
         tab_mid.auto_set_font_size(False)
         tab_mid.set_fontsize(10)
         tab_mid.scale(1.0, 1.20)
@@ -1088,63 +1242,30 @@ def save_charts_and_tables(
             elif j == 0:
                 cell.set_text_props(weight="bold")
             try:
-                fam = (
-                        _CHOSEN_CJK
-                        or (rcParams.get("font.family") or [""])[0]
-                        or "sans-serif"
-                )
+                fam = (_CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif")
                 cell.get_text().set_fontfamily(fam)
             except Exception:
                 pass
         ax_mid.set_title(
             "Middle: Path Min – MaxDD + (CAGR/Risk/Sharpe/Drawups) — medians across rolling windows",
-            fontsize=12,
-            fontweight="bold",
-            pad=1,
+            fontsize=12, fontweight="bold", pad=1,
         )
 
-        # Bottom notes
+        # --- Bottom notes (left-aligned, bottom-left *inside* the bottom panel) ---
         ax_bot = fig.add_subplot(gs[2, 0])
         ax_bot.axis("off")
-        if use_dca_value_table:
-            notes_lines = [
-                "Notes (DCA):",
-                "• Top — Final Value distribution (currency) across rolling windows.",
-                "• Middle — Medians across windows:",
-                " - Path Min/Max (Med): Median of within-window portfolio VALUE min/max (contributions at period start; none at last step).",
-                " - Tot CAGR (Simple, Med): Principal-based annualized rate with total contributed principal (I0 + A × #contrib).",
-                " - IRR (Med): Money-weighted return solved from the median Final Value and the DCA cash-flow schedule.",
-                " - Risk/Sharpe/Max Drawup/Max DD: Computed on price-path basis; drawup/down from normalized paths.",
-                "Assumptions: data freq sets ppy; DCA schedule follows '--dca-interval'; last period has no new contribution.",
-            ]
-        else:
-            notes_lines = [
-                "Notes (Lump Sum):",
-                "• Top — Return distribution (%, rolling windows) across portfolios.",
-                "• Middle — Medians across windows:",
-                " - Path Min/Max (Med): Median of within-window normalized path extrema (start=1).",
-                " - CAGR/Risk/Sharpe: Standard annualization with ppy set by '--freq'.",
-                " - Max Drawup/Max DD: Max cumulative rise/fall from rolling normalized path.",
-            ]
-        notes_text = "\n".join(notes_lines)
         ax_bot.text(
-            0.01,
-            0.8,
+            0.0, 0.02,  # a tiny lift from the bottom edge
             notes_text,
-            ha="left",
-            va="top",
-            fontsize=10,
-            linespacing=1.3,
+            ha="left", va="bottom",
+            fontsize=6, color="#555555",
             transform=ax_bot.transAxes,
-            fontfamily=(
-                    _CHOSEN_CJK or (rcParams.get("font.family") or [""])[0] or "sans-serif"
-            ),
+            linespacing=1.15,
         )
 
-        plt.tight_layout()
-        save_with_watermarks(
-            output_dir / "performance_summary_table_notes.png", bbox_inches="tight"
-        )
+        # Tight layout is safe because notes are inside ax_bot, not figure margins
+        fig.tight_layout()
+        save_with_watermarks(output_dir / "performance_summary_table_notes.png", bbox_inches="tight")
 
         # ===== NEW: Excel export (mirrors the same content) =====
 

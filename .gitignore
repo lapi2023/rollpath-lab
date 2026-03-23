@@ -9,6 +9,7 @@ watermark.py
 scripts/
 *.cmd
 *.csv
+*private*.pem
 
 # User-specific files
 *.rsuser

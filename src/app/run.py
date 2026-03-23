@@ -278,15 +278,19 @@ def run_analysis(args) -> None:
         console, tax_rate=float(args.tax_rate), rebalance=str(args.rebalance)
     )
 
-    # Load data
+    # Restrict the loader to only the series actually required by current portfolios.
+    required_series = sorted({k for w in settings.PORTFOLIOS.values() for k in w.keys()})
+    series_specs_subset = {k: settings.SERIES_SPECS[k] for k in required_series if k in settings.SERIES_SPECS}
+
     prices_pd = load_data(
         settings.DATA_DIR,
-        settings.SERIES_SPECS,
+        series_specs_subset,  # was: settings.SERIES_SPECS
         settings.START_DATE,
         settings.END_DATE,
         args.freq,
         args.missing,
     ).sort_index()
+
     returns_pd = (
         prices_pd.pct_change(fill_method=None)
         .dropna(how="all")
@@ -304,9 +308,29 @@ def run_analysis(args) -> None:
         console,
     )
 
+    # Determine which series are actually required by the current set of portfolios.
+    used_series = sorted({k for weights in settings.PORTFOLIOS.values() for k in weights.keys()})
+    used_return_cols = [f"Return_{s}" for s in used_series if f"Return_{s}" in returns_pd.columns]
+
+    # Filter to rows where all required series have valid returns, then compute start/end on that subset.
+    valid_df = returns_pd if not used_return_cols else returns_pd.dropna(subset=used_return_cols, how="any")
+
+    # Determine the analysis span only from rows where all required series are present.
+    used_return_cols = [c for c in returns_pd.columns if c.startswith("Return_")]
+    valid_df = returns_pd if not used_return_cols else returns_pd.dropna(subset=used_return_cols, how="any")
+
+    actual_start = pd.to_datetime(valid_df["Date"]).min()
+    actual_end = pd.to_datetime(valid_df["Date"]).max()
+
+    # Keep the Polars mirror for downstream computations as before.
     merged_df = pl.from_pandas(returns_pd)
-    actual_start = merged_df.select(pl.col("Date").min()).item()
-    actual_end = merged_df.select(pl.col("Date").max()).item()
+
+    console.print(
+        "[bold cyan]Data Period:[/]" + " " + str(actual_start) + " to " + str(actual_end) + "\n"
+    )
+
+    # Keep the Polars mirror for downstream computations as before.
+    merged_df = pl.from_pandas(returns_pd)
     console.print(
         "[bold cyan]Data Period:[/] "
         + str(actual_start)
