@@ -19,6 +19,8 @@ from rich.table import Table
 # --- REPLACED: smarter label anchor with explicit side & vertical preference ---
 import matplotlib.dates as _mdates
 
+DEFAULT_DPI = 150
+
 def _smart_label_anchor(
     ax,
     x_data,
@@ -298,16 +300,6 @@ if not _CHOSEN_CJK:
 # =============================================================================
 # Save (delegate watermark)
 # =============================================================================
-
-def save_with_watermarks(filepath: Path, dpi: int = 150, bbox_inches=None) -> None:
-    """
-    Save the current Matplotlib figure WITHOUT any watermark overlay.
-    Watermarking is handled in a separate project; this project intentionally saves clean images.
-    """
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(filepath, dpi=dpi, bbox_inches=bbox_inches)
-    plt.close()
-
 
 # =============================================================================
 # Helpers (robust access)
@@ -1076,7 +1068,7 @@ def save_charts_and_tables(
     plt.ylabel("Density")
     plt.legend(loc="upper right")
     plt.tight_layout()
-    save_with_watermarks(output_dir / "return_dist_combined.png")
+    plt.savefig(output_dir / "return_dist_combined.png", dpi=DEFAULT_DPI)
 
     # ---------- (2) Return Boxplot ----------
     plt.figure(figsize=(10, max(4, n_ports * 1.5)))
@@ -1112,7 +1104,7 @@ def save_charts_and_tables(
     plt.title(f"Return Boxplot ({val} {unit})\n{caption}", fontsize=12, pad=15)
     plt.xlabel("Return (%)")
     plt.tight_layout()
-    save_with_watermarks(output_dir / "return_boxplot.png")
+    plt.savefig(output_dir / "return_boxplot.png", dpi=DEFAULT_DPI)
 
     # ---------- (3) Win Rate Matrix ----------
     # Pairwise Final Value comparison per rolling window (ties excluded by default)
@@ -1174,7 +1166,7 @@ def save_charts_and_tables(
         ]
     _add_foot_lines(fig, "\n".join(foot_lines), max_fontsize=6)
 
-    save_with_watermarks(output_dir / "win_rate_matrix.png", bbox_inches="tight")
+    plt.savefig(output_dir / "win_rate_matrix.png", dpi=DEFAULT_DPI,bbox_inches="tight")
 
     # ---------- (4) Performance Summary Table ----------
     try:
@@ -1485,7 +1477,7 @@ def save_charts_and_tables(
 
         # Tight layout is safe because notes are inside ax_bot, not figure margins
         fig.tight_layout()
-        save_with_watermarks(output_dir / "performance_summary_table_notes.png", bbox_inches="tight")
+        plt.savefig(output_dir / "performance_summary_table_notes.png", bbox_inches="tight", dpi=DEFAULT_DPI)
 
         # ===== NEW: Excel export (mirrors the same content) =====
 
@@ -1689,7 +1681,7 @@ def save_charts_and_tables(
                 ax.legend(loc="best")
 
             plt.tight_layout()
-            save_with_watermarks(output_dir / "typical_value_mean_all_ports.png", dpi=150)
+            plt.savefig(output_dir / "typical_value_mean_all_ports.png", dpi=DEFAULT_DPI)
 
             # ---------- Median (linear) + final labels ----------
             plt.figure(figsize=(12, 6))
@@ -1763,7 +1755,7 @@ def save_charts_and_tables(
                 ax.legend(loc="best")
 
             plt.tight_layout()
-            save_with_watermarks(output_dir / "typical_value_median_all_ports.png", dpi=150)
+            plt.savefig(output_dir / "typical_value_median_all_ports.png", dpi=DEFAULT_DPI)
     except Exception as e:
         print("[viz] Typical paths error:", e)
         pass
@@ -2176,8 +2168,8 @@ def save_charts_and_tables(
                 ),
             )
             fig.tight_layout(rect=(0, 0.05, 1, 0.95))
-            save_with_watermarks(
-                output_dir / "tax_summary_table.png", bbox_inches="tight"
+            plt.savefig(
+                output_dir / "tax_summary_table.png", dpi=DEFAULT_DPI ,bbox_inches="tight"
             )
 
             n = len(portfolio_names)
@@ -2213,7 +2205,7 @@ def save_charts_and_tables(
                 ax.grid(True, axis="y", alpha=0.3)
             axes[-1].set_xlabel("Date")
             plt.tight_layout()
-            save_with_watermarks(output_dir / "tax_paid_time_series.png")
+            plt.savefig(output_dir / "tax_paid_time_series.png", dpi=DEFAULT_DPI)
     except Exception:
         pass
 
@@ -2292,8 +2284,8 @@ def save_charts_and_tables(
                 ),
             )
             plt.tight_layout()
-            save_with_watermarks(
-                output_dir / "rolling_tax_summary_table.png", bbox_inches="tight"
+            plt.savefig(
+                output_dir / "rolling_tax_summary_table.png", dpi=DEFAULT_DPI,bbox_inches="tight"
             )
     except Exception:
         pass
