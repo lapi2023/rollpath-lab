@@ -129,19 +129,6 @@ def _match_series_spec_first(paths: list[Path]) -> list[Path]:
             (matched if fnmatch.fnmatch(p.name, pat) else rest).append(p)
     return matched + rest
 
-def resolve_default_csv() -> Optional[Path]:
-    data_dir = Path(_get("DATA_DIR", Path.cwd()))
-    if not data_dir.exists():
-        return None
-    candidates = _exclude_names(_iter_csv_files(data_dir))
-    if not candidates:
-        return None
-    candidates = _match_series_spec_first(candidates)
-    try:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-    except Exception:
-        return candidates[0] if candidates else None
-
 # ------------------------------- CLI ----------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:

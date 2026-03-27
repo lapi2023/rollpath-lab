@@ -423,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     spx_path = resolve_latest(args.spx)
     div_path = resolve_latest(args.dividend)
 
-    spx = read_price_csv_two_col(path, assume_header=None, verbose=True)
+    spx = read_price_csv_two_col(spx_path, assume_header=None, verbose=True)
     if args.start:
         spx = spx[spx['Date'] >= pd.to_datetime(args.start)]
     if args.end:

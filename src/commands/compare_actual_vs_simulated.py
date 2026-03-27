@@ -367,8 +367,8 @@ def run_for_symbol(
     actual_meta = latest_actual_for_symbol(symbol)
     simulated_meta = latest_simulated_for_symbol(symbol)
 
-    df_actual = read_price_csv(actual_meta.path)
-    df_sim = read_price_csv(simulated_meta.path)
+    df_actual = read_price_csv_two_col(actual_meta.path)
+    df_sim = read_price_csv_two_col(simulated_meta.path)
 
     if end is not None:
         df_actual = read_price_csv_two_col(actual_meta.path)

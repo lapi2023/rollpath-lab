@@ -312,18 +312,11 @@ def run_analysis(args) -> None:
     used_series = sorted({k for weights in settings.PORTFOLIOS.values() for k in weights.keys()})
     used_return_cols = [f"Return_{s}" for s in used_series if f"Return_{s}" in returns_pd.columns]
 
-    # Filter to rows where all required series have valid returns, then compute start/end on that subset.
-    valid_df = returns_pd if not used_return_cols else returns_pd.dropna(subset=used_return_cols, how="any")
-
     # Determine the analysis span only from rows where all required series are present.
-    used_return_cols = [c for c in returns_pd.columns if c.startswith("Return_")]
     valid_df = returns_pd if not used_return_cols else returns_pd.dropna(subset=used_return_cols, how="any")
 
     actual_start = pd.to_datetime(valid_df["Date"]).min()
     actual_end = pd.to_datetime(valid_df["Date"]).max()
-
-    # Keep the Polars mirror for downstream computations as before.
-    merged_df = pl.from_pandas(returns_pd)
 
     console.print(
         "[bold cyan]Data Period:[/]" + " " + str(actual_start) + " to " + str(actual_end) + "\n"

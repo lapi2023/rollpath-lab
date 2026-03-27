@@ -276,3 +276,13 @@ def format_integer_commas(num: float | int) -> str:
         return f"{int(round(float(num))):,}"
     except Exception:
         return str(num)
+
+def _infer_ppy_from_freq(freq: str) -> int:
+    f = (freq or "").lower()
+    if f in ("", "daily", "day"):
+        return 252
+    if f in ("monthly", "month"):
+        return 12
+    if f in ("yearly", "year"):
+        return 1
+    return 252

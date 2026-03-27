@@ -7,6 +7,8 @@ from typing import Dict
 import pandas as pd
 from rich.console import Console
 
+
+from src.utils import _infer_ppy_from_freq
 try:
     from src.dividend_loader import (
         DividendInputPaths,
@@ -26,17 +28,6 @@ def _portfolios_require_cash(portfolios: Dict[str, Dict[str, float]]) -> bool:
             if str(k).strip().upper() == "CASH":
                 return True
     return False
-
-
-def _infer_ppy_from_freq(freq: str) -> int:
-    f = (freq or "").lower()
-    if f in ("", "daily", "day"):
-        return 252
-    if f in ("monthly", "month"):
-        return 12
-    if f in ("yearly", "year"):
-        return 1
-    return 252
 
 
 def _inject_cash_series_flat(returns_pd: pd.DataFrame, console: Console) -> pd.DataFrame:

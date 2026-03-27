@@ -299,7 +299,7 @@ if not _CHOSEN_CJK:
 # Save (delegate watermark)
 # =============================================================================
 
-def save_with_watermarks(filepath: Path, dpi: int = 300, bbox_inches=None) -> None:
+def save_with_watermarks(filepath: Path, dpi: int = 150, bbox_inches=None) -> None:
     """
     Save the current Matplotlib figure WITHOUT any watermark overlay.
     Watermarking is handled in a separate project; this project intentionally saves clean images.
