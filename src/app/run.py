@@ -405,15 +405,28 @@ def run_analysis(args) -> None:
                 dca_interval=str(args.dca_interval),
             )
 
-        # Typical VALUE paths (Mean/Median) from log-domain with sampling
+        # Typical VALUE paths (Mean/Median) from sampled windows
         typical_value_mean: Dict[str, np.ndarray] = {}
         typical_value_median: Dict[str, np.ndarray] = {}
         date_arr = returns_pd["Date"].to_numpy()
+
+        # --- helper: step size from DCA interval ---
+        def _step_from_interval(ppy_: int, inter: str) -> int:
+            s = (str(inter or "every_period")).lower()
+            if s in ("", "every_period"): return 1
+            if s == "weekly":    return max(1, int(round((ppy_ or 252) / 52)))
+            if s == "monthly":   return max(1, int(round((ppy_ or 252) / 12)))
+            if s == "quarterly": return max(1, int(round((ppy_ or 252) / 4)))
+            if s == "yearly":    return max(1, int(round((ppy_ or 252) / 1)))
+            return 1
+
         for p in portfolio_names:
             r = returns_dict[p].astype(np.float32, copy=False).reshape(-1)
             N = int(r.shape[0])
             if N < window:
                 continue
+
+            # build log price and select evenly spaced windows
             r_clip = np.clip(r, -0.999999, None)
             logP = np.cumsum(np.log1p(r_clip), dtype=np.float64)
             nW = N - window + 1
@@ -421,19 +434,39 @@ def run_analysis(args) -> None:
             if m < 1:
                 continue
             idxs = np.linspace(0, nW - 1, num=m, dtype=int)
-            paths = np.empty((m, window), dtype=np.float32)
-            for i, s in enumerate(idxs):
-                seg = logP[s : s + window]
-                paths[i, :] = np.exp(seg - seg[0])
-            init_eff = (
-                float(args.initial) if (args.initial and args.initial > 0) else 1.0
-            )
-            typical_value_mean[p] = (paths.mean(axis=0) * init_eff).astype(
-                np.float32, copy=False
-            )
-            typical_value_median[p] = (np.median(paths, axis=0) * init_eff).astype(
-                np.float32, copy=False
-            )
+
+            # allocate sampled paths
+            paths = np.empty((m, window), dtype=np.float64)
+
+            if str(args.style).lower() == "dca":
+                # DCA: VALUE_t = Pn_t * (initial + amount * cumsum(1/Pn at contribution steps))
+                step = _step_from_interval(int(ppy), str(args.dca_interval))
+                mask = np.zeros((window,), dtype=np.float64)
+                upto = max(0, window - 1)  # no contribution at the very last step
+                mask[0:upto:step] = 1.0
+
+                eps = 1e-12
+                init_cap = float(args.initial or 0.0)
+                amt = float(args.amount or 0.0)
+
+                for i, s in enumerate(idxs):
+                    seg = logP[s: s + window]
+                    Pn = np.exp(seg - seg[0])  # normalized price path (start=1)
+                    invPn = 1.0 / np.clip(Pn, eps, None)
+                    shares = init_cap + amt * np.cumsum(invPn * mask)  # currency shares path
+                    V = Pn * shares  # VALUE in currency
+                    paths[i, :] = V
+
+            else:
+                # Lump-sum: currency VALUE_t = initial_effective * Pn_t
+                init_eff = float(args.initial) if (args.initial and args.initial > 0) else 1.0
+                for i, s in enumerate(idxs):
+                    seg = logP[s: s + window]
+                    Pn = np.exp(seg - seg[0])
+                    paths[i, :] = (Pn * init_eff)
+
+            typical_value_mean[p] = paths.mean(axis=0).astype(np.float32, copy=False)
+            typical_value_median[p] = np.median(paths, axis=0).astype(np.float32, copy=False)
 
         # Representative percentile paths (Min/P25/Med/P75/Max)
         #

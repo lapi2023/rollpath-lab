@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from typing import List
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
@@ -529,6 +530,14 @@ def _year_ticks(L: int, ppy: int):
     labels = [f"Y{int(round(t / float(ppy)))}" for t in ticks]
     return ticks, labels
 
+def _monthly_bar_positions(L: int, ppy: int) -> np.ndarray:
+    """
+    Return 0-based step indices (no bar on the very last step) for monthly contributions.
+    Bars are placed every round(ppy/12) steps to approximate calendar months.
+    """
+    step = max(1, int(round((ppy or 252) / 12)))
+    upto = max(0, L - 1)  # do not place a bar at the very last step
+    return np.arange(0, upto, step, dtype=int)
 
 def _dca_irr_from_median_fv(
     fv_median: float,
@@ -936,12 +945,6 @@ def print_summary_table(
             )
         console.print(summary_table)
 
-
-# CHANGED: hide "(n=...)" and colorize cells (>50% green, <50% red)
-from typing import List
-import numpy as np
-from rich.console import Console
-from rich.table import Table
 
 def print_win_rate_table(
     console: Console,
@@ -1571,195 +1574,78 @@ def save_charts_and_tables(
     except Exception:
         pass
 
-    # ---------- (5) Typical VALUE paths (Mean-only & Median-only) + CSV----------
-    try:
-        tv_mean = typical_value_mean or {}
-        tv_median = typical_value_median or {}
-        L = None
-        for p in portfolio_names:
-            if p in tv_mean:
-                L = len(tv_mean[p])
-                break
-        if L and L > 0:
-            step_arr = np.arange(1, L + 1, dtype=int)
-            contrib = np.zeros(L, dtype=float)
-            if is_dca and amount and amount > 0:
-                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
-                contrib[mask] = float(amount)
+    # --- Typical VALUE path — MEAN/MEDIAN across all portfolios (single left axis; daily lines + monthly principal bars) ---
+    if typical_value_mean or typical_value_median:
+        for label, source in [("mean", typical_value_mean), ("median", typical_value_median)]:
+            if not source:
+                continue
 
-            # CSV（従来通り）
-            df_mean = pd.DataFrame({"Step": step_arr, "ContributionPerPeriod": contrib})
+            fig, ax = plt.subplots(figsize=(12, 6))
+            L = None
+            y_max = 0.0
+
+            # Lines: daily VALUE in currency (already built as currency paths)
             for p in portfolio_names:
-                if p in tv_mean:
-                    df_mean[p] = tv_mean[p]
-            df_mean.to_csv(
-                output_dir / "typical_value_mean_all_ports.csv",
-                index=False,
-                encoding="utf-8-sig",
-            )
-
-            df_median = pd.DataFrame(
-                {"Step": step_arr, "ContributionPerPeriod": contrib}
-            )
-            for p in portfolio_names:
-                if p in tv_median:
-                    df_median[p] = tv_median[p]
-                elif p in tv_mean:
-                    df_median[p] = tv_mean[p]
-            df_median.to_csv(
-                output_dir / "typical_value_median_all_ports.csv",
-                index=False,
-                encoding="utf-8-sig",
-            )
-
-            # ---------- Mean (linear) + final labels ----------
-            plt.figure(figsize=(12, 6))
-            ax = plt.gca()
-            if is_dca and amount and amount > 0:
-                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
-                ax2 = ax.twinx()
-                bar_x = np.arange(1, L + 1, dtype=int)[mask]
-                # Make contribution bars bolder and in front of the grid/lines just enough.
-                ax2.bar(
-                    bar_x,
-                    np.full(bar_x.shape, float(amount)),
-                    width=3.0,  # thicker bars (was 1.8)
-                    color="#5f5f5f",  # darker neutral
-                    alpha=0.55,  # more opaque (was 0.22)
-                    edgecolor="#3d3d3d",  # subtle outline
-                    linewidth=0.35,
-                    label="Contribution (schedule)",
-                    zorder=3,  # lift above most lines; still below annotations
+                v = np.asarray(source.get(p, []), dtype=float)
+                if v.size == 0:
+                    continue
+                if L is None:
+                    L = int(v.size)
+                x = np.arange(1, v.size + 1, dtype=int)  # daily steps (1..L)
+                ln, = ax.plot(x, v, lw=1.8, label=p, zorder=4)
+                y_max = max(y_max, float(np.nanmax(v)))
+                ax.annotate(
+                    format_integer_commas(v[-1]),
+                    xy=(x[-1], v[-1]),
+                    xytext=(6, 8),
+                    textcoords="offset points",
+                    fontsize=9,
+                    color=ln.get_color(),
                 )
 
-                ax2.set_ylabel("Contribution per period")
-
-            for p in portfolio_names:
-                if p in tv_mean:
-                    # y is the typical normalized price path Pn (start=1)
-                    y = np.asarray(tv_mean[p], dtype=float)
-
-                    # --- DCA only: convert Pn -> VALUE (currency) ---
-                    if is_dca:
-                        # Contribution schedule (start-of-period, no last-step contrib)
-                        mask_bool = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
-                        inv_pn = 1.0 / np.clip(y, 1e-12, None)
-                        shares = float(initial_cap or 0.0) + float(amount or 0.0) * np.cumsum(
-                            inv_pn * mask_bool.astype(float))
-                        y_plot = y * shares  # VALUE in currency units
-                    else:
-                        y_plot = y  # Lump sum: keep as-is (currency if initial_cap>0 else index-like)
-
-                    ax.plot(step_arr, y_plot, label=f"{p} Mean", linewidth=1.9, zorder=5)
-
-                    # final value label (currency-friendly)
-                    ax.annotate(
-                        f"{y_plot[-1]:,.0f}",
-                        xy=(step_arr[-1], y_plot[-1]),
-                        xytext=(5, 0),
-                        textcoords="offset points",
-                        va="center",
-                        fontsize=9,
-                        color="#333",
+            # Bars: monthly Total Principal (cumulative), same left axis
+            if L and is_dca and float(amount) > 0:
+                bar_idx = _monthly_bar_positions(L, ppy)  # 0-based positions for monthly marks (no bar at last)
+                if bar_idx.size > 0:
+                    # cumulative principal at each monthly bar: Initial + Amount * (#contrib up to that month)
+                    n = int(bar_idx.size)
+                    principal_vals = (float(initial_cap) + float(amount) * np.arange(1, n + 1, dtype=float))
+                    y_max = max(y_max, float(np.nanmax(principal_vals)))
+                    ax.bar(
+                        bar_idx + 1,  # align to step axis (1..L)
+                        principal_vals,
+                        width=0.60,
+                        color="#8a8a8a",
+                        alpha=0.35,
+                        edgecolor="#6b6b6b",
+                        label="Total Principal (monthly)",
+                        zorder=2,
                     )
 
-            # Left axis → portfolio amount; format as K/M/B/T
-            ax.set_ylabel("Portfolio amount")
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+            # X-axis ticks: keep Y1, Y2, ... while the underlying line is daily
+            if L:
+                ticks, labels_ = _year_ticks(L, ppy)  # Y1, Y2, ...
+                ax.set_xticks(ticks)
+                ax.set_xticklabels(labels_)
 
-            # Right axis (contribution) → also format
-            if is_dca and amount and amount > 0:
-                ax2.set_ylabel("Contribution per period")
-                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
+            # Axis/legend formatting (English)
+            if y_max > 0:
+                ax.set_ylim(0.0, y_max * 1.15)  # headroom for annotations/bars
+            ax.set_xlabel("Years")
+            ax.set_ylabel("Portfolio Amount")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: format_number_kmg(v)))
+            ax.grid(True, lw=0.3, alpha=0.5)
 
-            # Legend merge unchanged
-            if is_dca and amount and amount > 0:
-                lines, labels = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines + lines2, labels + labels2, loc="best")
-            else:
-                ax.legend(loc="best")
+            # Title with caption (includes Total Principal when DCA)
+            ax.set_title(f"Typical Value Path ({val} {unit})\n{caption}", loc="left", fontsize=12)
 
-            plt.tight_layout()
-            plt.savefig(output_dir / "typical_value_mean_all_ports.png", dpi=DEFAULT_DPI)
+            handles, labels_all = ax.get_legend_handles_labels()
+            ax.legend(handles, labels_all, loc="best", ncol=2)
 
-            # ---------- Median (linear) + final labels ----------
-            plt.figure(figsize=(12, 6))
-            ax = plt.gca()
-            if is_dca and amount and amount > 0:
-                mask = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
-                ax2 = ax.twinx()
-                bar_x = np.arange(1, L + 1, dtype=int)[mask]
-                # Make contribution bars bolder and in front of the grid/lines just enough.
-                ax2.bar(
-                    bar_x,
-                    np.full(bar_x.shape, float(amount)),
-                    width=3.0,  # thicker bars (was 1.8)
-                    color="#5f5f5f",  # darker neutral
-                    alpha=0.55,  # more opaque (was 0.22)
-                    edgecolor="#3d3d3d",  # subtle outline
-                    linewidth=0.35,
-                    label="Contribution (schedule)",
-                    zorder=3,  # lift above most lines; still below annotations
-                )
-
-                ax2.set_ylabel("Contribution per period")
-
-            for p in portfolio_names:
-                src = None
-                if p in tv_median:
-                    src = np.asarray(tv_median[p], dtype=float)
-                    series_label = f"{p} Median"
-                elif p in tv_mean:
-                    src = np.asarray(tv_mean[p], dtype=float)
-                    series_label = f"{p} Median(n/a→Mean)"
-                else:
-                    continue
-
-                # src is typical normalized price path Pn (median or fallback)
-                y = src
-
-                if is_dca:
-                    mask_bool = _contrib_mask_for_window(L, ppy, dca_interval or "every_period")
-                    inv_pn = 1.0 / np.clip(y, 1e-12, None)
-                    shares = float(initial_cap or 0.0) + float(amount or 0.0) * np.cumsum(
-                        inv_pn * mask_bool.astype(float))
-                    y_plot = y * shares
-                else:
-                    y_plot = y
-
-                ax.plot(step_arr, y_plot, label=series_label, linewidth=1.9, linestyle="-", zorder=5)
-
-                ax.annotate(
-                    f"{y_plot[-1]:,.0f}",
-                    xy=(step_arr[-1], y_plot[-1]),
-                    xytext=(5, 0),
-                    textcoords="offset points",
-                    va="center",
-                    fontsize=9,
-                    color="#333",
-                )
-
-            ax.set_ylabel("Portfolio amount")
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
-
-            if is_dca and amount and amount > 0:
-                ax2.set_ylabel("Contribution per period")
-                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: format_number_kmg(x)))
-
-            if is_dca and amount and amount > 0:
-                lines, labels = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines + lines2, labels + labels2, loc="best")
-            else:
-                ax.legend(loc="best")
-
-            plt.tight_layout()
-            plt.savefig(output_dir / "typical_value_median_all_ports.png", dpi=DEFAULT_DPI)
-    except Exception as e:
-        print("[viz] Typical paths error:", e)
-        pass
-
+            fig.tight_layout()
+            out = output_dir / f"typical_value_{label}_all_ports.png"
+            fig.savefig(out, dpi=DEFAULT_DPI)
+            plt.close(fig)
     # ---------- (6) Representative percentile paths → STACKED (linear only) + CSV ----------
     try:
         reps = representative_paths or {}
