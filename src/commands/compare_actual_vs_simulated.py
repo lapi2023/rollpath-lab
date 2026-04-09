@@ -37,13 +37,6 @@ from src import settings
 from src.commands.generate_leveraged_etf import find_latest_file
 from src.utils import read_price_csv_two_col
 
-try:
-    from src.visualizer import save_with_watermarks
-except Exception:
-    def save_with_watermarks(path: Path, dpi: int = 150):
-        plt.savefig(path, dpi=dpi)
-
-
 # ---------------------------------------------------------------------------
 # Font helper
 # ---------------------------------------------------------------------------
@@ -299,7 +292,7 @@ def plot_divergence(symbol: str, result: CompareResult, outdir: Path) -> Path:
 
     outpath = outdir / f"{symbol}_divergence.png"
     fig.tight_layout()
-    save_with_watermarks(outpath, dpi=150)
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
     return outpath
 
@@ -344,7 +337,7 @@ def plot_normalized(symbol: str, result: CompareResult, outdir: Path) -> Path:
 
     outpath = outdir / f"{symbol}_normalized.png"
     fig.tight_layout()
-    save_with_watermarks(outpath, dpi=150)
+    plt.savefig(outpath, dpi=150)
     plt.close(fig)
     return outpath
 

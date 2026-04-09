@@ -87,7 +87,8 @@ RISK_FREE_RATE = 0.033
 # Rolling window settings (used by main.py rolling analysis)
 # ---------------------------------------------------------------------------
 # Which investment windows to evaluate by default (e.g., 10, 20, 30 years)
-INVESTMENT_PERIOD_VALUES = [i for i in range(5, 31, 5)] + [40, 50, 60, 70]
+# INVESTMENT_PERIOD_VALUES = [i for i in range(5, 31, 5)] + [40, 50, 60, 70]
+INVESTMENT_PERIOD_VALUES = [i for i in range(5, 31, 5)]
 # Window unit: 'days' | 'months' | 'years'
 INVESTMENT_PERIOD_UNIT = "years"
 
@@ -147,7 +148,7 @@ SERIES_SPECS = {
 # Weights are automatically normalized if they do not sum exactly to 1.0.
 PORTFOLIOS = {
     "S&P500": {"SP500_TR": 1.0},
-    # "Nasdaq-100": {"NDX_TR": 1.0},
+    "Nasdaq-100": {"NDX_TR": 1.0},
     "sim_SSO": {"SSO_2x_TR": 1.0},
     "sim_SPXL": {"SPXL_3x_TR": 1.0},
     "sim_QLD": {"QLD_2x_TR": 1.0},
@@ -156,13 +157,42 @@ PORTFOLIOS = {
     # "S&P500 25/75 SSO": {"SP500_TR": 0.25, "SSO_2x_TR": 0.75},
     # "S&P500 50/50 SSO": {"SP500_TR": 0.5,  "SSO_2x_TR": 0.5},
     # "S&P500 75/25 SSO": {"SP500_TR": 0.75, "SSO_2x_TR": 0.25},
-    #
-    # "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
-    # "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
+
+    "S&P500 25/75 SPXL": {"SP500_TR": 0.25, "SPXL_3x_TR": 0.75},
+    "S&P500 50/50 SPXL": {"SP500_TR": 0.5,  "SPXL_3x_TR": 0.5},
     # "S&P500 75/25 SPXL": {"SP500_TR": 0.75, "SPXL_3x_TR": 0.25},
-    # "SSO 25/75 SPXL": {"SSO_2x_TR": 0.25, "SPXL_3x_TR": 0.75},
-    # "SSO 50/50 SPXL": {"SSO_2x_TR": 0.5, "SPXL_3x_TR": 0.5},
+    "SSO 25/75 SPXL": {"SSO_2x_TR": 0.25, "SPXL_3x_TR": 0.75},
+    "SSO 50/50 SPXL": {"SSO_2x_TR": 0.5, "SPXL_3x_TR": 0.5},
     # "SSO 75/25 SPXL": {"SSO_2x_TR": 0.75, "SPXL_3x_TR": 0.25},
+
+    "NDX 25/75 QLD": {"NDX_TR": 0.25, "QLD_2x_TR": 0.75},
+    "NDX 50/50 QLD": {"NDX_TR": 0.5, "QLD_2x_TR": 0.5},
+    "NDX 75/25 QLD": {"NDX_TR": 0.75, "QLD_2x_TR": 0.25},
+
+    "NDX 25/75 TQQQ": {"NDX_TR": 0.25, "TQQQ_3x_TR": 0.75},
+    "NDX 50/50 TQQQ": {"NDX_TR": 0.5, "TQQQ_3x_TR": 0.5},
+    "NDX 75/25 TQQQ": {"NDX_TR": 0.75, "TQQQ_3x_TR": 0.25},
+
+    "QLD 25/75 TQQQ": {"QLD_2x_TR": 0.25, "TQQQ_3x_TR": 0.75},
+    "QLD 50/50 TQQQ": {"QLD_2x_TR": 0.5, "TQQQ_3x_TR": 0.5},
+    "QLD 75/25 TQQQ": {"QLD_2x_TR": 0.75, "TQQQ_3x_TR": 0.25},
+
+    "S&P500 25/75 QLD": {"SP500_TR": 0.25, "QLD_2x_TR": 0.75},
+    "S&P500 50/50 QLD": {"SP500_TR": 0.5, "QLD_2x_TR": 0.5},
+    "S&P500 75/25 QLD": {"SP500_TR": 0.75, "QLD_2x_TR": 0.25},
+
+    "S&P500 25/75 TQQQ": {"SP500_TR": 0.25, "TQQQ_3x_TR": 0.75},
+    "S&P500 50/50 TQQQ": {"SP500_TR": 0.5, "TQQQ_3x_TR": 0.5},
+    "S&P500 75/25 TQQQ": {"SP500_TR": 0.75, "TQQQ_3x_TR": 0.25},
+
+    "SSO 25/75 TQQQ": {"SSO_2x_TR": 0.25, "TQQQ_3x_TR": 0.75},
+    "SSO 50/50 TQQQ": {"SSO_2x_TR": 0.5, "TQQQ_3x_TR": 0.5},
+    "SSO 75/25 TQQQ": {"SSO_2x_TR": 0.75, "TQQQ_3x_TR": 0.25},
+
+    "SPXL 25/75 TQQQ": {"SPXL_3x_TR": 0.25, "TQQQ_3x_TR": 0.75},
+    "SPXL 50/50 TQQQ": {"SPXL_3x_TR": 0.5, "TQQQ_3x_TR": 0.5},
+    "SPXL 75/25 TQQQ": {"SPXL_3x_TR": 0.75, "TQQQ_3x_TR": 0.25},
+
     # "SPXL 50/Cash 50": {"SPXL_3x_TR": 0.50, "CASH": 0.50},  If you want cash in portoflio
 }
 

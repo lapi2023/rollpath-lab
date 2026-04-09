@@ -609,6 +609,7 @@ def _dca_irr_from_median_fv(
             hi, fhi = mid, fm
     return float(0.5 * (lo + hi))
 
+
 # =============================================================================
 # Excel export helper for Performance Summary Table + Notes
 # =============================================================================
@@ -1374,8 +1375,13 @@ def save_charts_and_tables(
                     ]
                 )
 
-        # ---- build PNG----
+        # ---- Build PNG (auto-sized; prevents title/table overlap) ----
         fig_w = max(14.0, min(6.0 + 1.20 * n_ports, 32.0))
+
+        # Table typography: keep default until 18 portfolios, then gently shrink
+        table_fontsize = 10 if n_ports <= 18 else max(7, int(round(10 - 0.22 * (n_ports - 18))))
+        table_scale_y = 1.20 if n_ports <= 18 else max(0.95, 1.20 - 0.018 * (n_ports - 18))
+
         fig_h = 8.5 if n_ports <= 6 else min(8.5 + 0.35 * (n_ports - 6), 14.0)
 
         # --- Prepare notes text early (to size the bottom panel dynamically) ---
@@ -1416,16 +1422,34 @@ def save_charts_and_tables(
         # Bottom panel height (relative) grows gently with note lines (clamped)
         h_bot = min(3.5, max(1.2, 0.16 * n_note_lines))
 
+        # Height: ensure each table axis has enough inches for (header + portfolios) rows
+        # plus a two-line title, given the GridSpec height ratios.
+        n_rows = n_ports + 1  # header + portfolios
+        row_in = 0.26 * table_scale_y  # approx inches per row at this scale
+        title_in = 0.95  # space for a two-line title
+
+        needed_ax_in = title_in + row_in * n_rows
+        sum_ratios = 6.4 + h_bot  # 3.2 + 3.2 + h_bot
+        fig_h_min = needed_ax_in * (sum_ratios / 3.2)
+
+        # Clamp to avoid extreme figures while still supporting 18+ portfolios cleanly
+        fig_h = float(np.clip(fig_h_min, 8.5, 22.0))
+
         fig = plt.figure(figsize=(fig_w, fig_h))
         gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3.2, 3.2, h_bot])
 
         # --- Top table ---
         ax_top = fig.add_subplot(gs[0, 0])
         ax_top.axis("off")
-        tab_top = ax_top.table(cellText=rows_top, colLabels=cols_top, loc="center", cellLoc="center")
+        tab_top = ax_top.table(
+            cellText=rows_top,
+            colLabels=cols_top,
+            cellLoc="center",
+            bbox=[0.0, 0.0, 1.0, 0.90],  # reserve top space for the title
+        )
         tab_top.auto_set_font_size(False)
-        tab_top.set_fontsize(10)
-        tab_top.scale(1.0, 1.20)
+        tab_top.set_fontsize(table_fontsize)
+        tab_top.scale(1.0, table_scale_y)
         for (i, j), cell in tab_top.get_celld().items():
             if i == 0:
                 cell.set_text_props(weight="bold")
@@ -1440,16 +1464,21 @@ def save_charts_and_tables(
         cap_mode = "DCA (values)" if use_dca_value_table else "Returns"
         ax_top.set_title(
             f"Performance Summary — Top: Mean to Max ({val} {unit}) [{cap_mode}]\n{caption}",
-            fontsize=12, fontweight="bold", pad=1,
+            fontsize=12, fontweight="bold", pad=8,
         )
 
         # --- Middle table ---
         ax_mid = fig.add_subplot(gs[1, 0])
         ax_mid.axis("off")
-        tab_mid = ax_mid.table(cellText=rows_mid, colLabels=cols_mid, loc="center", cellLoc="center")
+        tab_mid = ax_mid.table(
+            cellText=rows_mid,
+            colLabels=cols_mid,
+            cellLoc="center",
+            bbox=[0.0, 0.0, 1.0, 0.90],  # reserve top space for the title
+        )
         tab_mid.auto_set_font_size(False)
-        tab_mid.set_fontsize(10)
-        tab_mid.scale(1.0, 1.20)
+        tab_mid.set_fontsize(table_fontsize)
+        tab_mid.scale(1.0, table_scale_y)
         for (i, j), cell in tab_mid.get_celld().items():
             if i == 0:
                 cell.set_text_props(weight="bold")
@@ -1463,7 +1492,7 @@ def save_charts_and_tables(
                 pass
         ax_mid.set_title(
             "Middle: Path Min – MaxDD + (CAGR/Risk/Sharpe/Drawups) — medians across rolling windows",
-            fontsize=12, fontweight="bold", pad=1,
+            fontsize=12, fontweight="bold", pad=8,
         )
 
         # --- Bottom notes (left-aligned, bottom-left *inside* the bottom panel) ---
@@ -1482,7 +1511,7 @@ def save_charts_and_tables(
         fig.tight_layout()
         plt.savefig(output_dir / "performance_summary_table_notes.png", bbox_inches="tight", dpi=DEFAULT_DPI)
 
-        # ===== NEW: Excel export (mirrors the same content) =====
+        # ===== Excel export (mirrors the same content) =====
 
         # Meta for reproducibility
         meta = {
@@ -1822,6 +1851,7 @@ def save_charts_and_tables(
                 fig = ax.figure
                 fig.tight_layout()
                 fig.savefig(output_dir / outname_img, dpi=150)
+                plt.close(fig)
 
                 # --- Draw Max Drawdown / Max Drawup between bar-top points (compute on NATIVE series) ---
 
@@ -1937,8 +1967,7 @@ def save_charts_and_tables(
                 annotated_name = outname_img.replace(".png", "_annotated.png")
                 fig.tight_layout()
                 fig.savefig(output_dir / annotated_name, dpi=150)
-                import matplotlib.pyplot as _plt
-                _plt.close(fig)
+                plt.close(fig)
 
                 # ---------- CSV（従来のネイティブ＋プロット後の2種） ----------
                 cmask = item.get("contrib_mask", None)
@@ -2092,6 +2121,7 @@ def save_charts_and_tables(
             axes[-1].set_xlabel("Date")
             plt.tight_layout()
             plt.savefig(output_dir / "tax_paid_time_series.png", dpi=DEFAULT_DPI)
+
     except Exception:
         pass
 
@@ -2175,3 +2205,5 @@ def save_charts_and_tables(
             )
     except Exception:
         pass
+
+    plt.close("all")
